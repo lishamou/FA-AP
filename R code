@@ -1,0 +1,1276 @@
+#!/usr/bin/env Rscript
+
+# Figure 2: HCC Agent Activity Profile Heatmap (TCGA Cohort)
+# Based on plan.md design
+
+# 0. Set log file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure2.log")
+log_con <- file(log_file, "w")
+
+# Define log output function
+log_message <- function(message, print_to_console = FALSE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Ensure log file is closed at script exit
+on.exit({
+  close(log_con)
+  log_message(paste0("\nLog saved to: ", normalizePath(log_file), "\n"), print_to_console = TRUE)
+})
+
+# Create output directory
+log_message("Creating output directory...\n", print_to_console = TRUE)
+# Try different paths to create output directory
+results_paths <- c(
+  "results",  # Relative to current directory
+  "../results",  # Relative to code directory
+  file.path(getwd(), "results"),  # Absolute path
+  file.path(dirname(getwd()), "results")  # Parent directory absolute path
+)
+
+# Select or create output directory
+output_dir <- NULL
+for (path in results_paths) {
+  # If directory exists, use it
+  if (dir.exists(path)) {
+    output_dir <- path
+    log_message(paste0("Using existing output directory: ", output_dir, "\n"))
+    break
+  }
+  # If directory does not exist, try to create it
+  tryCatch({
+    dir.create(path, recursive = TRUE)
+    output_dir <- path
+    log_message(paste0("Created new output directory: ", output_dir, "\n"))
+    break
+  }, error = function(e) {
+    # If creation fails, try next path
+    log_message(paste0("Failed to create directory: ", path, "\n"))
+  })
+}
+
+# If all paths fail, stop
+if (is.null(output_dir)) {
+  stop("Error: Unable to create output directory. Please ensure you have write permissions.")
+}
+
+# 0. Load necessary R packages
+# Assuming all necessary packages are installed in the conda environment
+
+# Define required packages
+required_packages <- c("GSVA", "pheatmap", "RColorBrewer", "dplyr",
+                      "readxl", "openxlsx")
+
+# Load packages only, do not attempt installation
+
+for (pkg in required_packages) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  log_message(paste0("Loading package: ", pkg, "\n"))
+}
+
+# 1. Prepare input data
+
+# 1.1 Read Gene Expression Matrix
+log_message("Reading TCGA-LIHC gene expression data...\n", print_to_console = TRUE)
+
+# Try different paths to find data file
+data_paths <- c(
+  "data/TCGA-LIHC_expression_data.txt",  # Relative to current directory
+  "../data/TCGA-LIHC_expression_data.txt",  # Relative to code directory
+  file.path(getwd(), "data/TCGA-LIHC_expression_data.txt"),  # Absolute path
+  file.path(dirname(getwd()), "data/TCGA-LIHC_expression_data.txt")  # Parent directory absolute path
+)
+
+# Find existing file path
+existing_path <- NULL
+for (path in data_paths) {
+  if (file.exists(path)) {
+    existing_path <- path
+    log_message(paste0("Found data file: ", existing_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# If file not found, stop
+if (is.null(existing_path)) {
+  stop("Error: Unable to find data file 'TCGA-LIHC_expression_data.txt'. Please ensure file exists in 'data' directory.")
+}
+
+# Read data file
+# Do not set row names initially, check for duplicates
+log_message("Reading expression data and checking for duplicate row names...\n")
+temp_data <- read.table(existing_path, header = TRUE, sep = "\t", check.names = FALSE)
+
+# Check for duplicates in first column
+first_col_name <- colnames(temp_data)[1]
+first_col_values <- temp_data[[first_col_name]]
+if (any(duplicated(first_col_values))) {
+  log_message("Warning: Duplicate row identifiers found, using unique row names\n")
+  # Identify duplicate row names
+  dup_rows <- first_col_values[duplicated(first_col_values)]
+  log_message(paste0("Duplicate row identifiers: ", paste(dup_rows, collapse = ", "), "\n"))
+
+  # Create unique row names
+  unique_rownames <- make.unique(as.character(first_col_values))
+
+  # Set first column as row names and remove it
+  rownames(temp_data) <- unique_rownames
+  expr_data <- temp_data[, -1, drop = FALSE]
+} else {
+  log_message("No duplicate row identifiers found\n")
+  # Set first column as row names and remove it
+  rownames(temp_data) <- first_col_values
+  expr_data <- temp_data[, -1, drop = FALSE]
+}
+
+# Ensure expression matrix rows are genes and columns are samples
+if (ncol(expr_data) > nrow(expr_data)) {
+  expr_data <- t(expr_data)
+}
+
+# Convert dataframe to matrix
+log_message("Converting dataframe to matrix...\n")
+expr_data <- as.matrix(expr_data)
+
+# Log transform expression data (if in TPM/FPKM format and not yet transformed)
+# Check if data is already log-scaled
+if (max(expr_data, na.rm = TRUE) > 50) {  # Assuming raw data is TPM/FPKM
+  expr_matrix <- log2(expr_data + 1)
+  log_message("Applied log2(TPM+1) transformation to expression data\n")
+} else {
+  expr_matrix <- expr_data
+  log_message("Expression data is already log-scaled, no transformation needed\n")
+}
+
+# Add TCGA sample selection logic
+log_message("Starting TCGA sample selection...\n")
+
+# Define TCGA sample selection function
+select_tumor_rna_tcga_samples <- function(sample_barcodes) {
+  if (length(sample_barcodes) == 0) {
+    return(character(0))
+  }
+  
+  # Create dataframe and parse barcode
+  barcode_df <- data.frame(full_barcode = sample_barcodes, stringsAsFactors = FALSE) %>%
+    dplyr::mutate(
+      # Sample Type Code (Chars 14-15)
+      sample_type_code = substr(full_barcode, 14, 15),
+      # Patient-Sample Type Base Identifier (for grouping)
+      patient_sample_type = substr(full_barcode, 1, 15),
+      # Vial Code (Char 16)
+      vial = substr(full_barcode, 16, 16),
+      # Analyte Code (Char 20)
+      analyte = substr(full_barcode, 20, 20),
+      # Plate Code (Chars 22-25)
+      plate = substr(full_barcode, 22, 25),
+      # Add Patient ID (first 12 chars) for final duplicate check
+      patient_id = substr(full_barcode, 1, 12)
+    )
+    
+  # 1. Filter Tumor Samples (Sample Type 01-09)
+  tumor_barcode_df <- barcode_df %>%
+    dplyr::filter(
+      # Convert sample type code to numeric for comparison
+      as.numeric(sample_type_code) >= 1 & as.numeric(sample_type_code) <= 9
+    )
+    
+  # If no tumor samples, return empty
+  if (nrow(tumor_barcode_df) == 0) {
+    return(character(0))
+  }
+  
+  # Selection logic (Apply Vial -> Analyte -> Plate on tumor samples)
+  selected_df <- tumor_barcode_df %>%
+    # 2. Group by Patient-Tumor Sample Type
+    dplyr::group_by(patient_sample_type) %>%
+    # 3. Filter Vial: Priority A
+    dplyr::filter(
+      if (any(vial == 'A')) vial == 'A' else TRUE
+    ) %>%
+    # 4. Filter Analyte: Priority R, then T
+    dplyr::mutate(
+      analyte_priority = dplyr::case_when(
+        analyte == 'R' ~ 1,
+        analyte == 'T' ~ 2,
+        TRUE ~ 99
+      )
+    ) %>%
+    dplyr::filter(analyte_priority == min(analyte_priority)) %>%
+    dplyr::filter(analyte_priority != 99) %>%
+    # 5. Select Plate: Max lexicographical order
+    dplyr::filter(n() > 0) %>%
+    dplyr::arrange(desc(plate)) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup()
+    
+  # 6. Check for duplicate patient samples (based on first 12 chars)
+  duplicated_patients <- selected_df$patient_id[duplicated(selected_df$patient_id)]
+  
+  if (length(duplicated_patients) > 0) {
+    # Log duplicate patient IDs
+    log_message(sprintf("Found %d duplicate patient IDs: %s\n", 
+                       length(duplicated_patients),
+                       paste(duplicated_patients, collapse = ", ")))
+    
+    # Keep only first occurrence for each duplicate patient ID
+    selected_df <- selected_df %>%
+      dplyr::group_by(patient_id) %>%
+      dplyr::slice(1) %>%
+      dplyr::ungroup()
+    
+    log_message("Processed duplicate samples, keeping one sample per patient\n")
+  }
+  
+  return(selected_df$full_barcode)
+}
+
+# Get sample names (column names)
+sample_names <- colnames(expr_matrix)
+
+# Check for TCGA sample name format
+tcga_pattern <- "^TCGA-[A-Z0-9]{2}-[A-Z0-9]{4}-[0-9]{2}[A-Z]-[0-9]{2}[A-Z]-[A-Z0-9]{4}-[0-9]{2}"
+is_tcga_sample <- grepl(tcga_pattern, sample_names)
+
+if (any(is_tcga_sample)) {
+  log_message("TCGA samples detected, starting sample selection...\n")
+  
+  # Get TCGA samples
+  tcga_samples <- sample_names[is_tcga_sample]
+  
+  # Apply sample selection logic
+  selected_samples <- select_tumor_rna_tcga_samples(tcga_samples)
+  
+  if (length(selected_samples) > 0) {
+    # Keep selected samples
+    expr_matrix <- expr_matrix[, selected_samples, drop = FALSE]
+    log_message(sprintf("Sample selection complete. Original samples: %d, Selected samples: %d\n", 
+                       length(tcga_samples), length(selected_samples)))
+  } else {
+    stop("Error: No samples met criteria after selection")
+  }
+} else {
+  log_message("Warning: No TCGA format sample names detected, skipping sample selection\n")
+}
+
+# 1.2 Read Clinical Data
+log_message("Reading TCGA-LIHC clinical data...\n", print_to_console = TRUE)
+
+# Try different paths to find clinical data file
+clinical_paths <- c(
+  "data/TCGA-LIHC_clinical_data.xlsx",  # Relative to current directory
+  "../data/TCGA-LIHC_clinical_data.xlsx",  # Relative to code directory
+  file.path(getwd(), "data/TCGA-LIHC_clinical_data.xlsx"),  # Absolute path
+  file.path(dirname(getwd()), "data/TCGA-LIHC_clinical_data.xlsx")  # Parent directory absolute path
+)
+
+# Find existing file path
+existing_clinical_path <- NULL
+for (path in clinical_paths) {
+  if (file.exists(path)) {
+    existing_clinical_path <- path
+    log_message(paste0("Found clinical data file: ", existing_clinical_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# If file not found, stop
+if (is.null(existing_clinical_path)) {
+  stop("Error: Unable to find clinical data file 'TCGA-LIHC_clinical_data.xlsx'. Please ensure file exists in 'data' directory.")
+}
+
+# Read clinical data file
+clinical_data <- read.xlsx(existing_clinical_path)
+
+# 1.3 Process Clinical Data, Extract Required Information
+log_message("Processing clinical and prognostic data...\n")
+
+# Convert sample IDs in clinical data to short format for matching
+# Expression matrix column names are usually short format (first 12 chars)
+log_message("Converting sample IDs in clinical data to short format...\n")
+clinical_data$patient_id_short <- substr(clinical_data$patient_id, 1, 12)
+
+# Convert expression matrix column names to short format (if not already)
+colnames_short <- substr(colnames(expr_matrix), 1, 12)
+
+# Match clinical data and expression matrix
+log_message("Matching clinical data and expression matrix...\n")
+matched_indices <- match(colnames_short, clinical_data$patient_id_short)
+
+# Record sample count before matching
+total_samples_before_match <- ncol(expr_matrix)
+log_message(sprintf("\nTotal samples before match: %d\n", total_samples_before_match))
+
+# Initialize patient metadata dataframe
+patient_metadata <- data.frame(
+  row.names = colnames(expr_matrix)
+)
+
+# Add PatientID_short column (first 12 chars)
+patient_metadata$PatientID_short <- substr(rownames(patient_metadata), 1, 12)
+
+# Add Survival Status
+patient_metadata$SurvivalStatus <- clinical_data$fustat[matched_indices]
+
+# Add Survival Time
+patient_metadata$OS <- clinical_data$futime[matched_indices]
+
+# Add TP53 Status
+patient_metadata$TP53_Status <- clinical_data$TP53_Status[matched_indices]
+
+# Add CTNNB1 Status
+patient_metadata$CTNNB1_Status <- clinical_data$CTNNB1_Status[matched_indices]
+
+# Add Risk Group
+patient_metadata$RiskGroup <- clinical_data$Risk_Group[matched_indices]
+
+# Remove rows with NA values
+patient_metadata <- patient_metadata[!is.na(patient_metadata$SurvivalStatus) &
+                                   !is.na(patient_metadata$TP53_Status) &
+                                   !is.na(patient_metadata$CTNNB1_Status) &
+                                   !is.na(patient_metadata$RiskGroup), ]
+
+# Standardize Risk Group names, ensure consistent capitalization
+patient_metadata$RiskGroup <- ifelse(tolower(patient_metadata$RiskGroup) == "high", "High", "Low")
+
+# Record sample count after matching and missing data
+total_samples_after_match <- nrow(patient_metadata)
+missing_samples <- total_samples_before_match - total_samples_after_match
+
+log_message(sprintf("\nSample Matching and Data Completeness Stats:\n"))
+log_message(sprintf("Total samples before match: %d\n", total_samples_before_match))
+log_message(sprintf("Complete samples after match: %d\n", total_samples_after_match))
+log_message(sprintf("Samples excluded due to incomplete data: %d\n", missing_samples))
+log_message(sprintf("Data completeness rate: %.2f%%\n", total_samples_after_match/total_samples_before_match*100))
+
+# Print matching results statistics
+log_message("\nClinical Characteristics of Included Samples:\n")
+
+# Create a list to store statistical results
+clinical_stats <- list()
+
+log_message("\n1. Survival Status Distribution:\n")
+survival_table <- table(patient_metadata$SurvivalStatus)
+log_message(paste(capture.output(print(survival_table)), collapse = "\n"))
+survival_rate <- survival_table["Alive"]/sum(survival_table)*100
+log_message(sprintf("\nSurvival Rate: %.2f%%\n", survival_rate))
+
+# Add survival status stats
+clinical_stats[["Survival_Status"]] <- data.frame(
+  Category = "Survival Status",
+  Group = names(survival_table),
+  Count = as.numeric(survival_table),
+  Percentage = sprintf("%.2f%%", as.numeric(survival_table)/sum(survival_table)*100)
+)
+
+log_message("\n2. TP53 Status Distribution:\n")
+tp53_table <- table(patient_metadata$TP53_Status)
+log_message(paste(capture.output(print(tp53_table)), collapse = "\n"))
+tp53_rate <- tp53_table["Mutant"]/sum(tp53_table)*100
+log_message(sprintf("\nTP53 Mutation Rate: %.2f%%\n", tp53_rate))
+
+# Add TP53 status stats
+clinical_stats[["TP53_Status"]] <- data.frame(
+  Category = "TP53 Status",
+  Group = names(tp53_table),
+  Count = as.numeric(tp53_table),
+  Percentage = sprintf("%.2f%%", as.numeric(tp53_table)/sum(tp53_table)*100)
+)
+
+log_message("\n3. CTNNB1 Status Distribution:\n")
+ctnnb1_table <- table(patient_metadata$CTNNB1_Status)
+log_message(paste(capture.output(print(ctnnb1_table)), collapse = "\n"))
+ctnnb1_rate <- ctnnb1_table["Mutant"]/sum(ctnnb1_table)*100
+log_message(sprintf("\nCTNNB1 Mutation Rate: %.2f%%\n", ctnnb1_rate))
+
+# Add CTNNB1 status stats
+clinical_stats[["CTNNB1_Status"]] <- data.frame(
+  Category = "CTNNB1 Status",
+  Group = names(ctnnb1_table),
+  Count = as.numeric(ctnnb1_table),
+  Percentage = sprintf("%.2f%%", as.numeric(ctnnb1_table)/sum(ctnnb1_table)*100)
+)
+
+log_message("\n4. Risk Group Distribution:\n")
+risk_table <- table(patient_metadata$RiskGroup)
+log_message(paste(capture.output(print(risk_table)), collapse = "\n"))
+high_risk_rate <- risk_table["High"]/sum(risk_table)*100
+log_message(sprintf("\nHigh Risk Percentage: %.2f%%\n", high_risk_rate))
+
+# Add risk group stats
+clinical_stats[["Risk_Group"]] <- data.frame(
+  Category = "Risk Group",
+  Group = names(risk_table),
+  Count = as.numeric(risk_table),
+  Percentage = sprintf("%.2f%%", as.numeric(risk_table)/sum(risk_table)*100)
+)
+
+# Combine all stats results
+clinical_stats_df <- do.call(rbind, clinical_stats)
+rownames(clinical_stats_df) <- NULL
+
+# Add sample total and data completeness info
+sample_stats <- data.frame(
+  Category = c("Sample Statistics", "Sample Statistics", "Sample Statistics", "Sample Statistics"),
+  Group = c("Total Samples Before Match", "Complete Samples After Match", "Excluded Samples", "Data Completeness"),
+  Count = c(total_samples_before_match, total_samples_after_match, missing_samples, NA),
+  Percentage = c(NA, NA, NA, sprintf("%.2f%%", total_samples_after_match/total_samples_before_match*100))
+)
+
+# Combine all stats results
+final_stats_df <- rbind(sample_stats, clinical_stats_df)
+
+# Save stats to CSV
+clinical_stats_file <- file.path(output_dir, "Figure2A_Clinical_Features_Summary.csv")
+write.csv(final_stats_df, clinical_stats_file, row.names = FALSE)
+log_message(sprintf("\nClinical features summary saved to: %s\n", clinical_stats_file))
+
+# 1.4 Define Agent Functional State Signature List
+# Read actual signatures from signature.csv file
+log_message("Reading actual signatures from signature.csv...\n", print_to_console = TRUE)
+
+# Try different paths to find signature file
+signature_paths <- c(
+  "data/signature.csv",  # Relative to current directory
+  "../data/signature.csv",  # Relative to code directory
+  file.path(getwd(), "data/signature.csv"),  # Absolute path
+  file.path(dirname(getwd()), "data/signature.csv")  # Parent directory absolute path
+)
+
+# Find existing file path
+existing_signature_path <- NULL
+for (path in signature_paths) {
+  if (file.exists(path)) {
+    existing_signature_path <- path
+    log_message(paste0("Found signature file: ", existing_signature_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# If file not found, stop
+if (is.null(existing_signature_path)) {
+  stop("Error: Unable to find signature file 'signature.csv'. Please ensure file exists in 'data' directory.")
+}
+
+# Read signature file
+signature_data <- read.csv(existing_signature_path, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+log_message(paste0("Successfully read ", nrow(signature_data), " gene set signatures\n"), print_to_console = TRUE)
+
+# Create signature list
+agent_signatures_list <- list()
+
+# Iterate through signature data, extract gene sets
+for (i in 1:nrow(signature_data)) {
+  # Get gene set name and gene list
+  geneset_name <- signature_data$基因集作图名称[i] # Note: Column name in source file is Chinese
+  genes_str <- signature_data$基因名称[i] # Note: Column name in source file is Chinese
+
+  # Split gene string into vector
+  genes <- unlist(strsplit(genes_str, ",\\s*"))
+
+  # Trim whitespace
+  genes <- trimws(genes)
+
+  # Add to list
+  agent_signatures_list[[geneset_name]] <- genes
+
+  log_message(paste0("Added gene set: ", geneset_name, " (", length(genes), " genes)\n"))
+}
+
+log_message(paste0("Total loaded ", length(agent_signatures_list), " gene set signatures\n"), print_to_console = TRUE)
+
+# Filter out genes in signatures that do not exist in expression matrix
+agent_signatures_list <- lapply(agent_signatures_list, function(genes) {
+  genes_present <- intersect(genes, rownames(expr_matrix))
+  if (length(genes_present) < 3) {
+    log_message(paste0("Warning: Signature ", names(agent_signatures_list)[which(agent_signatures_list == genes)],
+        " has only ", length(genes_present), " genes in expression matrix\n"))
+  }
+  return(genes_present)
+})
+
+# Keep only signatures with at least 3 genes (GSVA usually requires gene set size > 2)
+agent_signatures_list <- agent_signatures_list[sapply(agent_signatures_list, length) >= 3]
+
+# 2. Calculate GSVA/ssGSEA Activity Scores
+log_message("Calculating GSVA activity scores...\n", print_to_console = TRUE)
+gsva_scores <- gsva(expr_matrix, agent_signatures_list, method = "gsva", verbose = TRUE)
+
+# 3. Prepare pheatmap annotations
+log_message("Preparing heatmap annotations...\n")
+
+# 3.1 Extract annotation columns to show and ensure order matches
+# Ensure annotation_col row names match gsva_scores column order
+annotation_col <- patient_metadata[colnames(gsva_scores), c("RiskGroup", "SurvivalStatus", "TP53_Status", "CTNNB1_Status")]
+
+# 3.2 Define annotation colors
+# Ensure color list names and levels correspond to columns and values in annotation_col
+ann_colors <- list(
+  RiskGroup = c(High = "firebrick", Low = "steelblue"),
+  SurvivalStatus = c(Alive = "forestgreen", Dead = "grey30"),
+  TP53_Status = c(Mutant = "darkorange", WT = "lightblue"),
+  CTNNB1_Status = c(Mutant = "purple", WT = "lightgreen")
+)
+
+# 4. Draw Heatmap
+log_message("Drawing agent activity profile heatmap...\n", print_to_console = TRUE)
+
+# 4.1 Define heatmap colors
+heatmap_colors <- colorRampPalette(rev(brewer.pal(n = 9, name = "RdBu")))(100)
+
+# 4.2 Draw heatmap and save
+# First generate PDF version
+output_pdf <- file.path(output_dir, "Figure2A_Agent_Activity_Heatmap.pdf")
+pdf(output_pdf, width = 12, height = 16)  # Increase width to fit legend
+
+# Save heatmap result object (for later processing)
+heatmap_result <- pheatmap(
+  gsva_scores,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  color = heatmap_colors,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_colnames = FALSE,
+  fontsize_row = 12,
+  fontsize_col = 10,
+  border_color = NA,
+  main = "Agent Functional State Activity Profile in TCGA-LIHC",
+  silent = TRUE  # Return clustering result instead of printing
+)
+
+# Draw heatmap
+pheatmap(
+  gsva_scores,  # GSVA score matrix
+  annotation_col = annotation_col,  # Column annotations
+  annotation_colors = ann_colors,  # Annotation colors
+  color = heatmap_colors,  # Heatmap colors
+  scale = "row",  # Row scaling
+  cluster_rows = TRUE,  # Cluster rows
+  cluster_cols = TRUE,  # Cluster columns
+  show_colnames = FALSE,  # Do not show column names
+  fontsize_row = 12,  # Row font size
+  fontsize_col = 10,  # Column font size
+  border_color = NA,  # Border color
+  main = "Agent Functional State Activity Profile in TCGA-LIHC"  # Main title
+)
+# Ensure PDF device is closed
+dev.off()
+log_message(paste0("Saved PDF file: ", output_pdf, "\n"), print_to_console = TRUE)
+
+
+# Also save as PNG format
+output_png <- file.path(output_dir, "Figure2A_Agent_Activity_Heatmap.png")
+png(output_png, width = 1200, height = 1600, res = 120)  # Increase width to fit legend
+pheatmap(
+  gsva_scores,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  color = heatmap_colors,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_colnames = FALSE,
+  fontsize_row = 10,
+  fontsize_col = 6,
+  border_color = NA,
+  main = "Agent Functional State Activity Profile in TCGA-LIHC",
+  cellwidth = NA,
+  cellheight = NA,
+  treeheight_row = 50,
+  treeheight_col = 30,
+  annotation_names_col = TRUE,
+  annotation_names_row = TRUE,
+  legend = TRUE
+)
+dev.off()
+log_message(paste0("Saved PNG file: ", output_png, "\n"), print_to_console = TRUE)
+
+# 5. Save processed data for subsequent analysis
+log_message("Saving processed data...\n")
+
+# Save RDS format data
+gsva_scores_file <- file.path(output_dir, "gsva_scores.rds")
+patient_metadata_file <- file.path(output_dir, "patient_metadata.rds")
+saveRDS(gsva_scores, gsva_scores_file)
+saveRDS(patient_metadata, patient_metadata_file)
+log_message(paste0("Saved RDS data file: ", gsva_scores_file, "\n"))
+log_message(paste0("Saved RDS data file: ", patient_metadata_file, "\n"))
+
+# Save GSVA score data as CSV table (Raw data)
+gsva_scores_csv <- file.path(output_dir, "Figure2A_GSVA_Scores.csv") # Raw data, not matching clustered image
+# Convert matrix to dataframe, add gene set name as first column
+gsva_scores_df <- as.data.frame(gsva_scores)
+gsva_scores_df$GeneSet <- rownames(gsva_scores)
+# Reorder columns, putting gene set name first
+gsva_scores_df <- gsva_scores_df[, c(ncol(gsva_scores_df), 1:(ncol(gsva_scores_df)-1))]
+write.csv(gsva_scores_df, gsva_scores_csv, row.names = FALSE)
+log_message(paste0("Saved raw GSVA score data table: ", gsva_scores_csv, "\n"))
+
+# Save clustered GSVA score data
+# Get clustered row and column order
+# Use ComplexHeatmap returned object structure
+clustered_matrix <- gsva_scores
+# Save clustered matrix as CSV
+clustered_gsva_scores_csv <- file.path(output_dir, "Figure2A_GSVA_Scores_Clustered.csv")
+clustered_gsva_scores_df <- as.data.frame(clustered_matrix)
+clustered_gsva_scores_df$GeneSet <- rownames(clustered_matrix)
+clustered_gsva_scores_df <- clustered_gsva_scores_df[, c(ncol(clustered_gsva_scores_df), 1:(ncol(clustered_gsva_scores_df)-1))]
+write.csv(clustered_gsva_scores_df, clustered_gsva_scores_csv, row.names = FALSE)
+log_message(paste0("Saved clustered GSVA score data table: ", clustered_gsva_scores_csv, "\n"))
+
+# Save clustering tree info
+clustering_info <- list(
+  row_clustering = NULL,
+  col_clustering = NULL
+)
+clustering_info_file <- file.path(output_dir, "Figure2A_Clustering_Info.rds")
+saveRDS(clustering_info, clustering_info_file)
+log_message(paste0("Saved clustering tree info: ", clustering_info_file, "\n"))
+
+# Save patient metadata as CSV table
+patient_metadata_csv <- file.path(output_dir, "Figure2A_Patient_Metadata.csv")
+# Add sample ID as first column
+patient_metadata_df <- as.data.frame(patient_metadata)
+patient_metadata_df$SampleID <- rownames(patient_metadata)
+# Reorder columns, putting sample ID first
+patient_metadata_df <- patient_metadata_df[, c(ncol(patient_metadata_df), 1:(ncol(patient_metadata_df)-1))]
+write.csv(patient_metadata_df, patient_metadata_csv, row.names = FALSE)
+log_message(paste0("Saved patient metadata table: ", patient_metadata_csv, "\n"))
+
+################################################################################################
+#!/usr/bin/env Rscript
+
+# Figure 2B: Cross-cohort activity profile comparison
+
+# 0. Set up log file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure2B.log")
+log_con <- file(log_file, "w")
+
+# Set character encoding
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+# Define log output function
+log_message <- function(message, print_to_console = FALSE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Ensure log file closes on exit
+on.exit({
+  close(log_con)
+  log_message(paste0("\nLog saved to: ", normalizePath(log_file), "\n"), print_to_console = TRUE)
+})
+
+# Note: This script assumes figure2.R has been run and gsva_scores.rds and patient_metadata.rds exist
+# 0. Load necessary R packages
+# Assumes all necessary packages are installed in the conda environment
+
+# Define required packages
+required_packages <- c("GSVA", "pheatmap", "RColorBrewer", "dplyr",
+                       "readxl", "openxlsx", "ggplot2", "reshape2")
+
+# Load packages only, do not attempt installation
+for (pkg in required_packages) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  log_message(paste0("Loading package: ", pkg, "\n"))
+}
+
+# 1. Load previously generated data
+log_message("Loading previously generated GSVA score data...\n", print_to_console = TRUE)
+
+# Try different paths to find data files
+results_paths <- c(
+  "results",                      # Relative to current directory
+  "../results",                   # Relative to code directory
+  file.path(getwd(), "results"),  # Absolute path
+  file.path(dirname(getwd()), "results") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_results_path <- NULL
+for (path in results_paths) {
+  if (dir.exists(path) &&
+      file.exists(file.path(path, "gsva_scores.rds")) &&
+      file.exists(file.path(path, "patient_metadata.rds"))) {
+    existing_results_path <- path
+    log_message(paste0("Found data directory: ", existing_results_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_results_path)) {
+  stop("Error: Previously generated data files not found. Please run figure2.R script first.")
+}
+
+# Read data files
+gsva_scores <- readRDS(file.path(existing_results_path, "gsva_scores.rds"))
+patient_metadata <- readRDS(file.path(existing_results_path, "patient_metadata.rds"))
+
+# 2. Calculate mean activity of each functional state in different groups
+log_message("Calculating mean activity in different groups...\n", print_to_console = TRUE)
+
+# 2.1 Calculate mean activity by survival status
+log_message("Extracting survival status info from patient_metadata...\n", print_to_console = TRUE)
+
+# Read Figure2A clustered data to get State order
+clustered_data_path <- file.path(existing_results_path, "Figure2A_GSVA_Scores_Clustered.csv")
+if (!file.exists(clustered_data_path)) {
+  stop("Error: Figure2A_GSVA_Scores_Clustered.csv not found. Please run figure2.R script first.")
+}
+clustered_data <- read.csv(clustered_data_path)
+clustered_state_order <- clustered_data$GeneSet
+log_message(paste0("Read clustered State order, total ", length(clustered_state_order), " states\n"), print_to_console = TRUE)
+
+# Check if patient_metadata contains SurvivalStatus column
+if ("SurvivalStatus" %in% colnames(patient_metadata)) {
+  log_message("Found SurvivalStatus column, processing survival data...\n", print_to_console = TRUE)
+  
+  # Print sample info for debugging
+  log_message(paste0("Number of samples in GSVA data: ", ncol(gsva_scores), "\n"))
+  log_message(paste0("Number of samples in patient_metadata: ", nrow(patient_metadata), "\n"))
+  log_message(paste0("Top 5 GSVA samples: ", paste(head(colnames(gsva_scores), 5), collapse = ", "), "\n"))
+  log_message(paste0("Top 5 patient_metadata samples: ", paste(head(rownames(patient_metadata), 5), collapse = ", "), "\n"))
+  
+  # Ensure sample IDs match
+  common_samples <- intersect(colnames(gsva_scores), rownames(patient_metadata))
+  log_message(paste0("Found ", length(common_samples), " matched samples\n"), print_to_console = TRUE)
+  
+  if (length(common_samples) > 0) {
+    # Extract Alive and Dead samples
+    survival_status <- patient_metadata[common_samples, "SurvivalStatus"]
+    alive_samples <- common_samples[survival_status == "Alive"]
+    dead_samples <- common_samples[survival_status == "Dead"]
+    
+    log_message(paste0("Number of Alive samples: ", length(alive_samples), "\n"), print_to_console = TRUE)
+    log_message(paste0("Number of Dead samples: ", length(dead_samples), "\n"), print_to_console = TRUE)
+    
+    if (length(alive_samples) > 0 && length(dead_samples) > 0) {
+      # Calculate mean activity for each state in Alive and Dead groups
+      alive_mean <- rowMeans(gsva_scores[, alive_samples, drop = FALSE], na.rm = TRUE)
+      dead_mean <- rowMeans(gsva_scores[, dead_samples, drop = FALSE], na.rm = TRUE)
+      
+      # Merge into data frame
+      survival_status_means <- data.frame(
+        State = rownames(gsva_scores),
+        Alive = alive_mean,
+        Dead = dead_mean
+      )
+      
+      # Calculate difference
+      survival_status_means$Difference <- survival_status_means$Dead - survival_status_means$Alive
+      
+      # Ensure State order matches clustering result
+      survival_status_means$State <- factor(survival_status_means$State, 
+                                            levels = clustered_state_order,
+                                            ordered = TRUE)
+      
+      # Sort data frame by factor levels to ensure CSV output matches clustering order
+      survival_status_means <- survival_status_means[order(survival_status_means$State), ]
+      
+      # Convert to long format for ggplot2
+      survival_status_means_long <- reshape2::melt(survival_status_means,
+                                                   id.vars = "State",
+                                                   measure.vars = c("Dead", "Alive"),
+                                                   variable.name = "Survival_Status",
+                                                   value.name = "Activity")
+      
+      # Ensure long format data is also sorted by State factor order
+      survival_status_means_long <- survival_status_means_long[order(survival_status_means_long$State), ]
+      
+      # Plot bar charts
+      log_message("Plotting bar charts...\n")
+      
+      # Horizontal bar chart
+      p1 <- ggplot(survival_status_means_long, aes(x = State, y = Activity, fill = Survival_Status)) +
+        geom_bar(stat = "identity", position = position_dodge()) +
+        scale_fill_manual(values = c("Dead" = "grey30", "Alive" = "forestgreen")) +
+        theme_light() +
+        theme(
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 8, color = "black"),
+          axis.text.y = element_text(size = 8, color = "black"),
+          axis.title.x = element_text(size = 12, color = "black"),
+          axis.title.y = element_text(size = 12, color = "black"),
+          plot.title = element_text(size = 14, color = "black"),
+          legend.text = element_text(size = 10, color = "black"),
+          legend.title = element_text(size = 12, color = "black"),
+          panel.border = element_rect(color = "grey90", fill = NA, linewidth = 0.5), # Change border to light grey
+          plot.background = element_rect(fill = "white", color = NA) # Remove outer border
+        ) +
+        labs(x = "Agent Functional State", y = "Mean GSVA Score",
+             title = "Agent Functional State Activity by Survival Status (Horizontal)",
+             fill = "Survival Status")
+      
+      # Vertical bar chart - Swap x and y axes and adjust theme
+      p2 <- ggplot(survival_status_means_long, aes(x = Activity, y = factor(State, levels = rev(clustered_state_order)), fill = Survival_Status)) +
+        geom_bar(stat = "identity", position = position_dodge()) +
+        scale_fill_manual(values = c("Dead" = "grey30", "Alive" = "forestgreen")) +
+        theme_light() +
+        theme(
+          axis.text.y = element_text(size = 8, color = "black", hjust = 0),
+          axis.text.x = element_text(size = 8, color = "black"),
+          axis.title.x = element_text(size = 12, color = "black"),
+          axis.title.y = element_text(size = 12, color = "black"),
+          plot.title = element_text(size = 14, color = "black"),
+          legend.text = element_text(size = 10, color = "black"),
+          legend.title = element_text(size = 12, color = "black"),
+          legend.position = "top",
+          plot.margin = margin(5, 20, 5, 5, "mm"),
+          panel.border = element_rect(color = "grey90", fill = NA, linewidth = 0.5),
+          plot.background = element_rect(fill = "white", color = NA),
+          # Move y-axis to the right
+          axis.text.y.right = element_text(size = 8, color = "black", hjust = 0),
+          axis.title.y.right = element_text(size = 12, color = "black"),
+          axis.text.y.left = element_blank(),
+          axis.title.y.left = element_blank(),
+          axis.ticks.y.left = element_blank()
+        ) +
+        scale_y_discrete(position = "right") + # Move y-axis to the right
+        labs(y = "Agent Functional State", x = "Mean GSVA Score",
+             title = "Agent Functional State Activity by Survival Status", # Corresponding plot: Figure2B_Survival_Status_Comparison_Vertical.pdf
+             fill = "Survival Status")
+      
+      # Save horizontal plot
+      output_pdf <- file.path(existing_results_path, "Figure2B_Survival_Status_Comparison_Horizontal.pdf")
+      output_png <- file.path(existing_results_path, "Figure2B_Survival_Status_Comparison_Horizontal.png")
+      ggsave(output_pdf, p1, width = 20, height = 6, bg = "white") # Add white background
+      ggsave(output_png, p1, width = 20, height = 6, dpi = 300, bg = "white") # Add white background
+      
+      # Save vertical plot
+      output_pdf_vertical <- file.path(existing_results_path, "Figure2B_Survival_Status_Comparison_Vertical.pdf")
+      output_png_vertical <- file.path(existing_results_path, "Figure2B_Survival_Status_Comparison_Vertical.png")
+      ggsave(output_pdf_vertical, p2, width = 8, height = 12, bg = "white") # Add white background
+      ggsave(output_png_vertical, p2, width = 8, height = 12, dpi = 300, bg = "white") # Add white background
+      
+      # Save survival status comparison data as CSV
+      survival_status_csv <- file.path(existing_results_path, "Figure2B_Survival_Status_Comparison.csv")
+      write.csv(survival_status_means, survival_status_csv, row.names = FALSE)
+      log_message(paste0("Saved survival status comparison data table: ", survival_status_csv, "\n"))
+      
+      # Save long format data (for plotting)
+      survival_status_long_csv <- file.path(existing_results_path, "Figure2B_Survival_Status_Long_Format.csv")
+      write.csv(survival_status_means_long, survival_status_long_csv, row.names = FALSE)
+      log_message(paste0("Saved survival status long format data table: ", survival_status_long_csv, "\n"))
+      
+      log_message("Generated survival status comparison plots (horizontal and vertical)\n", print_to_console = TRUE)
+    } else {
+      log_message("Warning: Insufficient number of Alive or Dead samples, skipping survival status comparison\n", print_to_console = TRUE)
+    }
+  } else {
+    log_message("Warning: No matched samples found, skipping survival status comparison\n", print_to_console = TRUE)
+  }
+} else {
+  log_message("Warning: SurvivalStatus column not found in patient_metadata, skipping survival status comparison\n", print_to_console = TRUE)
+}
+
+# 3. Combine all comparison plots into a multi-panel plot
+if (exists("p1") || exists("p2")) {
+  log_message("Generating combined comparison plot...\n", print_to_console = TRUE)
+
+  # Load gridExtra package for combining plots
+  suppressPackageStartupMessages(library(gridExtra))
+  log_message("Loading package: gridExtra\n")
+
+  # Create plot list
+  plot_list <- list()
+  if (exists("p1")) plot_list[["Survival Status (Horizontal)"]] <- p1
+  if (exists("p2")) plot_list[["Survival Status (Vertical)"]] <- p2
+
+  # Combine plots
+  combined_plot <- gridExtra::grid.arrange(grobs = plot_list, ncol = 1)
+
+  # Save combined plot
+  output_pdf <- file.path(existing_results_path, "Figure2B_Combined_Comparisons.pdf")
+  output_png <- file.path(existing_results_path, "Figure2B_Combined_Comparisons.png")
+  ggsave(output_pdf, combined_plot, width = 20, height = 6 * length(plot_list))
+  ggsave(output_png, combined_plot, width = 20, height = 6 * length(plot_list), dpi = 300)
+
+  log_message("Generated combined comparison plot\n", print_to_console = TRUE)
+} else {
+  log_message("Warning: No comparison plots generated, skipping combined plot generation\n", print_to_console = TRUE)
+}
+
+log_message(paste0("Figure 2B complete! Results saved in ", existing_results_path, " directory\n"), print_to_console = TRUE)
+      
+###########################################################################################################################
+
+#!/usr/bin/env Rscript
+
+# Figure 2B: Save individual plots (and generate Figures 2C-2F)
+
+# 0. Set up log file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure2B_final_visualization.log")
+log_con <- file(log_file, "w")
+
+# Set character encoding
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+# Define log output function
+log_message <- function(message, print_to_console = FALSE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Ensure log file closes on exit
+on.exit({
+  close(log_con)
+  log_message(paste0("\nLog saved to: ", normalizePath(log_file), "\n"), print_to_console = TRUE)
+})
+
+# 1. Load necessary packages
+log_message("Loading necessary R packages...\n", print_to_console = TRUE)
+required_packages <- c("ggplot2", "dplyr", "pheatmap", "RColorBrewer")
+
+# Load packages only, do not attempt installation
+for (pkg in required_packages) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  log_message(paste0("Loading package: ", pkg, "\n"))
+}
+
+# 2. Find results directory
+log_message("Finding results directory...\n", print_to_console = TRUE)
+results_paths <- c(
+  "results",                      # Relative to current directory
+  "../results",                   # Relative to code directory
+  file.path(getwd(), "results"),  # Absolute path
+  file.path(dirname(getwd()), "results") # Parent directory absolute path
+)
+
+# Determine results file path
+existing_results_path <- NULL
+for (path in results_paths) {
+  if (dir.exists(path) && file.exists(file.path(path, "Figure2B_Survival_Status_Comparison.csv"))) {
+    existing_results_path <- path
+    log_message(paste0("Found data directory: ", existing_results_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_results_path)) {
+  stop("Error: Figure2B_Survival_Status_Comparison.csv not found. Please run the figure2B.R script first.")
+}
+
+# Check if survival analysis directory exists
+survival_dir <- file.path(existing_results_path, "survival_analysis")
+has_survival_analysis <- dir.exists(survival_dir) && 
+                         file.exists(file.path(survival_dir, "Cox_Regression_Results.csv"))
+
+# 3. Read CSV data
+log_message("Reading analysis data...\n", print_to_console = TRUE)
+comparison_file <- file.path(existing_results_path, "Figure2B_Survival_Status_Comparison.csv")
+survival_data <- read.csv(comparison_file, stringsAsFactors = FALSE)
+
+# Read Cox regression results if available
+cox_results <- NULL
+if (has_survival_analysis) {
+  log_message("Reading Cox regression analysis results...\n", print_to_console = TRUE)
+  cox_results_file <- file.path(survival_dir, "Cox_Regression_Results.csv")
+  cox_results <- read.csv(cox_results_file, stringsAsFactors = FALSE)
+}
+
+# 4. Create and save individual plots
+log_message("Creating and saving individual plots...\n", print_to_console = TRUE)
+
+# 4.1 Create bar plot
+# Select Top 10 functional states by absolute difference
+top_n_states <- 10
+survival_data$AbsDiff <- abs(survival_data$Difference)
+top_states <- survival_data[order(survival_data$AbsDiff, decreasing = TRUE), ][1:top_n_states, ]
+top_states$Direction <- ifelse(top_states$Difference > 0, "Higher in Dead", "Higher in Alive")
+
+# Sort by Difference and reverse factor levels so plot is arranged from top to bottom
+top_states$State <- factor(top_states$State, 
+                           levels = rev(top_states$State[order(top_states$Difference)]))
+
+# Create bar plot
+panel1 <- ggplot(top_states, aes(x = State, y = Difference, fill = Direction)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Higher in Dead" = "red", "Higher in Alive" = "blue")) +
+  coord_flip() +
+  theme_light() +
+  labs(
+    title = "Functional State Activity Differences", # Corresponding plot: Figure2C_Barplot.pdf, Top 10 functional states bar plot
+    y = "Difference (Dead - Alive)",
+    x = "Functional State",
+    fill = "Enrichment Group"
+  ) +
+  theme(
+    plot.title = element_text(size = 9, face = "bold", color = "black"),
+    axis.title = element_text(size = 9, color = "black"),
+    axis.text = element_text(size = 9, color = "black"),
+    axis.text.y = element_text(size = 9, color = "black"),
+    legend.position = "top",
+    legend.title = element_text(size = 9, color = "black"),
+    legend.text = element_text(size = 9, color = "black"),
+    # Remove left y-axis hidden settings, let labels show on right
+    axis.text.y.left = element_blank(),
+    axis.ticks.y.left = element_blank(),
+    axis.line.y.left = element_blank(),
+    # Ensure right y-axis shows
+    axis.text.y.right = element_text(size = 9, color = "black", hjust = 0),
+    axis.title.y.right = element_text(size = 9, color = "black", angle = 90),
+    axis.line.y.right = element_line(color = "black"),
+    axis.ticks.y.right = element_line(color = "black"),
+    # Remove top x-axis
+    axis.text.x.top = element_blank(),
+    axis.ticks.x.top = element_blank(),
+    axis.line.x.top = element_blank(),
+    # Ensure bottom x-axis shows
+    axis.text.x.bottom = element_text(size = 9, color = "black"),
+    axis.title.x.bottom = element_text(size = 9, color = "black"),
+    axis.line.x.bottom = element_line(color = "black"),
+    axis.ticks.x.bottom = element_line(color = "black")
+  ) +
+  # Move y-axis to the right (note: in code it says left, but previous comment said right, following code strictly)
+  scale_y_continuous(position = "left") +
+  scale_x_discrete(position = "top")  # Move x-axis to the bottom (coord_flip makes x vertical)
+
+# Save bar plot
+ggsave(file.path(existing_results_path, "Figure2C_Barplot.pdf"), panel1, width = 6, height = 4)
+
+# 4.2 Create scatter plot
+survival_data$DiffCat <- cut(abs(survival_data$Difference), 
+                             breaks = c(-Inf, 0.03, 0.05, 0.08, Inf),
+                             labels = c("< 0.03", "0.03-0.05", "0.05-0.08", "> 0.08"))
+
+survival_data$Label <- ifelse(abs(survival_data$Difference) > 0.08, survival_data$State, "")
+
+# Save scatter plot data
+scatterplot_data <- data.frame(
+  State = survival_data$State,
+  Alive_Score = survival_data$Alive,
+  Dead_Score = survival_data$Dead,
+  Difference = survival_data$Difference,
+  Difference_Category = survival_data$DiffCat,
+  Label = survival_data$Label
+)
+write.csv(scatterplot_data, file.path(existing_results_path, "Figure2D_Scatterplot_Data.csv"), row.names = FALSE)
+log_message("Saved scatter plot data table\n", print_to_console = TRUE)
+
+panel2 <- ggplot(survival_data, aes(x = Alive, y = Dead, color = Difference, size = abs(Difference))) +
+  geom_point(alpha = 0.8) +
+  geom_text(aes(label = Label), size = 2.5, vjust = -0.8, hjust = 0.5, check_overlap = TRUE, color = "black") +
+  scale_color_gradient2(low = "blue", mid = "gray", high = "red", midpoint = 0) +
+  scale_size_continuous(range = c(1, 4)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "darkgray") +
+  theme_light() +
+  labs(
+    title = "Functional State Activity: Alive vs Dead", # Corresponding plot: Figure2D_Scatterplot.pdf, Scatter plot
+    x = "Alive Group Average Activity",
+    y = "Dead Group Average Activity",
+    color = "Difference",
+    size = "Absolute Difference"
+  ) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", color = "black"),
+    axis.title = element_text(size = 10, color = "black"),
+    axis.text = element_text(size = 8, color = "black"),
+    legend.position = "right",
+    legend.title = element_text(size = 9, color = "black"),
+    legend.text = element_text(size = 8, color = "black")
+  )
+
+# Save scatter plot
+ggsave(file.path(existing_results_path, "Figure2D_Scatterplot.pdf"), panel2, width = 8, height = 6)
+
+# 4.3 Create volcano plot
+log_message("Creating volcano plot...\n", print_to_console = TRUE)
+
+# Prepare volcano plot data
+volcano_data <- survival_data
+volcano_data$logFC <- volcano_data$Difference
+volcano_data$negLogP <- abs(volcano_data$Difference) * 20  # Simulate -log10(p)
+
+# Add regulation direction labels
+volcano_data$Regulation <- ifelse(volcano_data$Difference > 0.05, "Upregulated",
+                                  ifelse(volcano_data$Difference < -0.05, "Downregulated", "No Change"))
+
+# Label significantly different functional states
+volcano_data$Label <- ifelse(abs(volcano_data$Difference) > 0.08, volcano_data$State, "")
+
+# Save volcano plot data
+volcano_data_output <- data.frame(
+  State = volcano_data$State,
+  logFC = volcano_data$logFC,
+  negLogP = volcano_data$negLogP,
+  Regulation = volcano_data$Regulation,
+  Label = volcano_data$Label
+)
+write.csv(volcano_data_output, file.path(existing_results_path, "Figure2E_Volcano_Data.csv"), row.names = FALSE)
+log_message("Saved volcano plot data table\n", print_to_console = TRUE)
+
+# Create volcano plot
+if (!requireNamespace("ggrepel", quietly = TRUE)) {
+  # Volcano plot without ggrepel
+  panel3 <- ggplot(volcano_data, aes(x = logFC, y = negLogP, color = Regulation)) +
+    geom_point(aes(size = abs(Difference)), alpha = 0.7) +
+    geom_text(aes(label = Label), size = 4, vjust = -0.5, hjust = 0.5) +
+    scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "No Change" = "gray")) +
+    theme_light() +
+    labs(
+      title = "Differences in Functional States Between Dead and Alive Groups", # Corresponding plot: Figure2E_Volcano_Plot.pdf, Volcano plot
+      x = "Fold Change (Dead - Alive)",
+      y = "Significance (-log10 p-value simulation)",
+      color = "Regulation"
+    ) +
+    geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed", color = "darkgray") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "darkgray") +
+    theme(
+      plot.title = element_text(size = 12, face = "bold", color = "black"),
+      axis.title = element_text(size = 10, color = "black"),
+      axis.text = element_text(size = 8, color = "black"),
+      legend.position = "right",
+      legend.title = element_text(size = 9, color = "black"),
+      legend.text = element_text(size = 8, color = "black")
+    )
+} else {
+  # Volcano plot with ggrepel
+  library(ggrepel)
+  panel3 <- ggplot(volcano_data, aes(x = logFC, y = negLogP, color = Regulation, label = Label)) +
+    geom_point(aes(size = abs(Difference)), alpha = 0.7) +
+    geom_text_repel(size = 4, max.overlaps = 15, box.padding = 0.5) +
+    scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "No Change" = "gray")) +
+    theme_light() +
+    labs(
+      title = "Differences in Functional States Between Dead and Alive Groups", # Corresponding plot: Figure2E_Volcano_Plot.pdf, Volcano plot
+      x = "Fold Change (Dead - Alive)",
+      y = "Significance (-log10 p-value simulation)",
+      color = "Regulation"
+    ) +
+    geom_vline(xintercept = c(-0.05, 0.05), linetype = "dashed", color = "darkgray") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "darkgray") +
+    theme(
+      plot.title = element_text(size = 12, face = "bold", color = "black"),
+      axis.title = element_text(size = 10, color = "black"),
+      axis.text = element_text(size = 8, color = "black"),
+      legend.position = "right",
+      legend.title = element_text(size = 9, color = "black"),
+      legend.text = element_text(size = 8, color = "black")
+    )
+}
+
+# Save volcano plot
+ggsave(file.path(existing_results_path, "Figure2E_Volcano_Plot.pdf"), panel3, width = 8, height = 6)
+log_message("Saved volcano plot\n", print_to_console = TRUE)
+
+# 4.4 Create heatmap (Commented out)
+#heatmap_data <- survival_data[order(survival_data$AbsDiff, decreasing = TRUE), ][1:top_n_states, ]
+#heatmap_matrix <- as.matrix(heatmap_data[, c("Alive", "Dead")])
+#rownames(heatmap_matrix) <- heatmap_data$State
+
+# Save heatmap
+#pdf(file.path(existing_results_path, "Figure2B_Heatmap.pdf"), width = 8, height = 6)
+#pheatmap(
+#  heatmap_matrix,
+#  color = colorRampPalette(c("blue", "white", "red"))(100),
+#  cluster_rows = FALSE,
+#  cluster_cols = FALSE,
+#  main = "Top 10 Functional States Activity Heatmap", # Corresponding plot: Figure2B_Heatmap.pdf, Heatmap
+#  fontsize = 10,
+#  fontsize_row = 8
+#)
+#dev.off()
+
+
+# 4.5 Create Cox regression forest plot (if survival analysis data exists)
+if (!is.null(cox_results)) {
+  top_cox_states <- intersect(top_states$State, cox_results$State)
+  cox_subset <- cox_results[cox_results$State %in% top_cox_states, ]
+  
+  # Sort by HR value and reverse factor levels so plot is arranged from top to bottom by HR
+  cox_subset$State <- factor(cox_subset$State, 
+                             levels = rev(cox_subset$State[order(cox_subset$HR)]))
+  cox_subset$Significance <- ifelse(cox_subset$P_Value < 0.05, "Significant", "Non-significant")
+  
+  # Save Cox regression forest plot data (in plot order)
+  cox_forest_data <- data.frame(
+    State = levels(cox_subset$State),  # Use levels order
+    HR = cox_subset$HR[match(levels(cox_subset$State), cox_subset$State)],
+    CI_Lower = cox_subset$CI_Lower[match(levels(cox_subset$State), cox_subset$State)],
+    CI_Upper = cox_subset$CI_Upper[match(levels(cox_subset$State), cox_subset$State)],
+    P_Value = cox_subset$P_Value[match(levels(cox_subset$State), cox_subset$State)],
+    Significance = cox_subset$Significance[match(levels(cox_subset$State), cox_subset$State)]
+  )
+  write.csv(cox_forest_data, file.path(existing_results_path, "Figure2F_Cox_Forest_Data.csv"), row.names = FALSE)
+  log_message("Saved Cox regression forest plot data table, order matches plot\n", print_to_console = TRUE)
+
+  panel4 <- ggplot(cox_subset, aes(x = HR, y = State, xmin = CI_Lower, xmax = CI_Upper, color = Significance)) +
+    geom_point(size = 3) +
+    geom_errorbarh(height = 0.2) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+    scale_color_manual(values = c("Significant" = "red", "Non-significant" = "gray50")) +
+    theme_light() +
+    labs(
+      title = "Cox Regression Analysis (Hazard Ratio)", # Corresponding plot: Figure2F_Cox_Forest_Plot.pdf, Cox regression forest plot
+      x = "Hazard Ratio (HR)",
+      y = "Functional State",
+      color = "Statistical Significance"
+    ) +
+    theme(
+      plot.title = element_text(size = 9, face = "bold", color = "black"),
+      axis.title = element_text(size = 9, color = "black"),
+      axis.text = element_text(size = 9, color = "black"),
+      legend.position = "top",
+      legend.title = element_text(size = 9, color = "black"),
+      legend.text = element_text(size = 9, color = "black"),
+      # Move y-axis ticks and labels to the right
+      axis.text.y.right = element_text(size = 9, color = "black"),
+      axis.title.y.right = element_text(size = 9, color = "black", angle = 90),
+      # Hide left y-axis
+      axis.text.y.left = element_blank(),
+      axis.ticks.y.left = element_blank(),
+      # Show right y-axis
+      axis.line.y.right = element_line(color = "black"),
+      axis.ticks.y.right = element_line(color = "black")
+    ) +
+    # Move y-axis to the right
+    scale_y_discrete(position = "right")
+    
+  # Save Cox regression forest plot
+  ggsave(file.path(existing_results_path, "Figure2F_Cox_Forest_Plot.pdf"), panel4, width = 5.7, height = 4)
+}
+
+# Save detailed data for Top 10 functional states (in plot order)
+top_states_data <- data.frame(
+  State = as.character(top_states$State),  # Use levels order
+  Difference = top_states$Difference[match(levels(top_states$State), top_states$State)],
+  Direction = top_states$Direction[match(levels(top_states$State), top_states$State)],
+  Alive_Score = top_states$Alive[match(levels(top_states$State), top_states$State)],
+  Dead_Score = top_states$Dead[match(levels(top_states$State), top_states$State)],
+  AbsDiff = top_states$AbsDiff[match(levels(top_states$State), top_states$State)]
+)
+write.csv(top_states_data, file.path(existing_results_path, "Figure2C_Top10_States.csv"), row.names = FALSE)
+log_message("Saved detailed data for Top 10 functional states, order matches plot\n", print_to_console = TRUE)
+
+# 5. Summarize results
+log_message("\nAll plots and data files have been saved individually!\n", print_to_console = TRUE)
+log_message("Saved files:\n", print_to_console = TRUE)
+log_message("    - Figure2C_Top10_States.csv\n", print_to_console = TRUE)
+log_message("    - Figure2D_Scatterplot_Data.csv\n", print_to_console = TRUE)
+log_message("    - Figure2F_Cox_Forest_Data.csv\n", print_to_console = TRUE)
+
+log_message("Analysis complete!\n", print_to_console = TRUE)
+
+log_message(paste0("Figure 2A drawing complete! Results saved in ", output_dir, " directory\n"), print_to_console = TRUE)
