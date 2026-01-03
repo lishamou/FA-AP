@@ -1,0 +1,1375 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Optimized Survival Prediction Model for HCC Patients Based on Agent Activity Profiles - Python Implementation
+"""
+# -----------------------------------------------------------------------------
+# Logging Setup
+# -----------------------------------------------------------------------------
+
+def setup_logging(script_name):
+    """Setup logging"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"{script_name}_{timestamp}.log")
+    
+    class Logger(object):
+        def __init__(self, filename):
+            self.terminal = sys.stdout
+            self.log = open(filename, "w", encoding="utf-8")
+       
+        def write(self, message):
+            self.terminal.write(message)
+            self.log.write(message)
+            self.log.flush()
+            
+        def flush(self):
+            self.terminal.flush()
+            self.log.flush()
+    
+    sys.stdout = Logger(log_file)
+    print(f"Starting data preparation script, time: {timestamp}")
+    return log_file, timestamp
+
+# -----------------------------------------------------------------------------
+# Import Necessary Libraries
+# -----------------------------------------------------------------------------
+import os
+import sys
+import time
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib import cm
+import matplotlib.colors as mcolors
+import logging
+import joblib
+from datetime import datetime  # Added datetime module
+import warnings
+
+# Machine Learning Libraries
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, StratifiedKFold, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.metrics import roc_auc_score, roc_curve, auc, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve
+from sklearn.metrics import average_precision_score
+from imblearn.over_sampling import SMOTE
+import xgboost as xgb
+from xgboost import XGBClassifier
+from sklearn.ensemble import VotingClassifier, StackingClassifier
+from sklearn.base import clone
+from sklearn.neural_network import MLPClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+
+# Set plotting style
+# plt.style.use('seaborn-whitegrid')  # Old version style name
+try:
+    # Try using new version style name
+    plt.style.use('seaborn-v0_8-whitegrid')
+except:
+    # If failed, use default style
+    plt.style.use('default')
+    
+sns.set_style("whitegrid")
+plt.rcParams['axes.grid'] = True
+plt.rcParams['figure.figsize'] = [10, 6]
+plt.rcParams['figure.dpi'] = 100
+
+# Set fonts for Chinese and English support
+try:
+    plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'Arial', 'Songti SC']  # For correct display of Chinese and English labels
+    plt.rcParams['axes.unicode_minus'] = False  # For correct display of minus signs
+except:
+    print("Warning: Font setting failed, charts may not display characters correctly")
+
+# 0. Configure Logging
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"survival_prediction_optimized_py_{timestamp}.log")
+
+# Redirect output to log file and console
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+   
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = Logger(log_file)
+
+print(f"Starting optimized model script, time: {timestamp}")
+
+# Define generate_summary_report function at the beginning
+def generate_summary_report(results, best_model_name, feature_importance_df, selected_features, output_dir):
+    """
+    Generate a comprehensive report for model training and evaluation
+    """
+    report = []
+    
+    # 1. Dataset Information
+    report.append("# Model Training and Evaluation Report\n")
+    report.append("## 1. Dataset Information\n")
+    report.append(f"- Number of features: {len(selected_features)}")
+    
+    # 2. Model Performance
+    report.append("\n## 2. Model Performance\n")
+    report.append("### Best Model Performance\n")
+    report.append(f"- Best Model: {best_model_name}")
+    
+    # Get results for the best model
+    test_results = results[f"{best_model_name}_Test"]
+    train_results = results[f"{best_model_name}_Train"]
+    
+    # Calculate overfitting metrics
+    train_auc = train_results['auc']
+    test_auc = test_results['auc']
+    overfitting_ratio = train_auc / test_auc if test_auc > 0 else float('inf')
+    
+    report.append(f"- Test Set AUC: {test_auc:.4f}")
+    report.append(f"- Test Set Accuracy: {test_results['accuracy']:.4f}")
+    
+    report.append("\n### Overfitting Analysis\n")
+    report.append(f"- Training Set AUC: {train_auc:.4f}")
+    report.append(f"- Test Set AUC: {test_auc:.4f}")
+    report.append(f"- Overfitting Ratio (Train AUC / Test AUC): {overfitting_ratio:.4f}")
+    
+    if overfitting_ratio > 1.2:
+        report.append("- ⚠️ Warning: Model may be overfitting")
+        report.append("  Suggested actions:")
+        report.append("  * Increase regularization strength")
+        report.append("  * Reduce model complexity")
+        report.append("  * Use cross-validation")
+    else:
+        report.append("- ✅ Model generalization performance is good")
+    
+    # 3. Feature Importance Analysis
+    report.append("\n## 3. Feature Importance Analysis\n")
+    report.append("### Top 10 Most Important Features\n")
+    top_10_features = feature_importance_df.head(10)
+    for _, row in top_10_features.iterrows():
+        report.append(f"- {row['Feature']}: {row['Importance']:.4f}")
+    
+    # 4. Generated Visualizations
+    report.append("\n## 4. Generated Visualizations\n")
+    report.append("The following visualizations have been saved in the output directory:")
+    report.append("1. ROC Curve Comparison")
+    report.append("2. PR Curve")
+    report.append("3. Confusion Matrix")
+    report.append("4. Feature Importance Plot")
+    report.append("5. Model Performance Radar Chart")
+    
+    # 5. Conclusions and Recommendations
+    report.append("\n## 5. Conclusions and Recommendations\n")
+    
+    # Performance assessment
+    if test_auc >= 0.8:
+        performance = "Excellent"
+    elif test_auc >= 0.7:
+        performance = "Good"
+    else:
+        performance = "Average"
+    
+    report.append(f"1. Overall model performance is {performance}, with a Test Set AUC of {test_auc:.4f}")
+    
+    # Recommendations based on overfitting
+    if overfitting_ratio > 1.5:
+        report.append("2. Model shows significant overfitting. Recommendations:")
+        report.append("   - Increase training data")
+        report.append("   - Use stronger regularization")
+        report.append("   - Simplify model structure")
+    elif overfitting_ratio > 1.2:
+        report.append("2. Model shows slight overfitting. Recommendations:")
+        report.append("   - Consider using cross-validation")
+        report.append("   - Appropriately increase regularization")
+    else:
+        report.append("2. Model generalization performance is good. Consider:")
+        report.append("   - Increasing model complexity")
+        report.append("   - Exploring more feature combinations")
+    
+    # Save report
+    report_path = os.path.join(output_dir, "Model_Summary_Report.md")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(report))
+    
+    print(f"Model summary report generated: {report_path}")
+    return report_path
+
+# Add missing feature engineering functions
+def remove_redundant_features(X, features, correlation_threshold=0.8, return_pairs=False, return_corr=False):
+    """
+    Remove redundant features (high correlation features)
+    
+    Parameters:
+    X - Feature matrix
+    features - List of feature names
+    correlation_threshold - Correlation threshold, features higher than this will be considered redundant
+    return_pairs - Whether to return correlation pairs
+    return_corr - Whether to return correlation matrix
+    
+    Returns:
+    (Cleaned feature matrix, Cleaned feature name list, Correlation pairs, Correlation matrix)
+    """
+    print("\nAnalyzing feature correlation, removing redundant features...")
+    
+    # Convert feature matrix to DataFrame for correlation calculation
+    X_df = pd.DataFrame(X, columns=features)
+    
+    # Calculate correlation matrix between features
+    corr_matrix = np.abs(np.corrcoef(X.T))
+    np.fill_diagonal(corr_matrix, 0)  # Set diagonal values (feature correlation with itself) to 0
+    
+    # Find highly correlated feature pairs
+    redundant_pairs = []
+    n_features = len(features)
+    for i in range(n_features):
+        for j in range(i+1, n_features):
+            if corr_matrix[i, j] > correlation_threshold:
+                # Keep the feature with higher importance (here we use variance as a simple importance metric)
+                if np.var(X[:, i]) > np.var(X[:, j]):
+                    redundant_pairs.append((j, features[j], features[i], corr_matrix[i, j]))
+                else:
+                    redundant_pairs.append((i, features[i], features[j], corr_matrix[i, j]))
+    
+    # Construct set of features to remove
+    features_to_remove = set()
+    for idx, feature, paired_with, correlation in redundant_pairs:
+        features_to_remove.add(feature)
+        print(f"Feature '{feature}' is highly correlated with '{paired_with}' (r={correlation:.3f}) and will be removed")
+    
+    # Get indices of features to keep
+    keep_indices = [i for i, feature in enumerate(features) if feature not in features_to_remove]
+    
+    # Create cleaned feature set
+    X_clean = X[:, keep_indices]
+    features_clean = [features[i] for i in keep_indices]
+    
+    print(f"\nRemoved {len(features_to_remove)} redundant features, retained {len(features_clean)} features")
+    
+    returns = [X_clean, features_clean]
+    if return_pairs:
+        returns.append(redundant_pairs)
+    if return_corr:
+        returns.append(corr_matrix)
+    return tuple(returns)
+
+def create_interaction_features(X, features, top_n=10):
+    """
+    Create feature interaction terms
+    
+    Parameters:
+    X - Feature matrix
+    features - List of feature names
+    top_n - Number of top interaction features to select
+    
+    Returns:
+    (Interaction feature matrix, Interaction feature name list)
+    """
+    print("\nCreating feature interactions...")
+    
+    if len(features) < 2:
+        print("Insufficient features to create interaction features")
+        return None, []
+    
+    n_samples, n_features = X.shape
+    
+    # Create at most n_features*(n_features-1)/2 interaction features, but not exceeding top_n
+    max_interactions = min(int(n_features * (n_features - 1) / 2), 100, top_n)  # Limit max interaction features
+    
+    # Initialize interaction feature matrix and name list
+    X_interactions = np.zeros((n_samples, max_interactions))
+    interaction_names = []
+    
+    # Create all possible second-order interaction features
+    interaction_idx = 0
+    for i in range(n_features):
+        for j in range(i+1, n_features):
+            if interaction_idx >= max_interactions:
+                break
+            
+            # Create interaction feature (simple multiplication)
+            X_interactions[:, interaction_idx] = X[:, i] * X[:, j]
+            interaction_names.append(f"{features[i]}*{features[j]}")
+            interaction_idx += 1
+    
+    # Return None if no interaction features created
+    if interaction_idx == 0:
+        return None, []
+    
+    # Crop interaction feature matrix
+    X_interactions = X_interactions[:, :interaction_idx]
+    
+    print(f"Created {interaction_idx} feature interaction terms")
+    
+    return X_interactions, interaction_names
+
+# 1. Prepare Data
+# 1.1 Find and load processed data file
+print("Finding and loading preprocessed data file...")
+
+# Define possible data file paths
+data_paths = [
+    "results/survival_prediction_data.pkl",  # New preprocessed data
+    os.path.join(os.getcwd(), "results/survival_prediction_data.pkl")  # Absolute path
+]
+
+# Find existing file path
+data_file_path = None
+for path in data_paths:
+    if os.path.exists(path):
+        data_file_path = path
+        print(f"Found preprocessed data file: {data_file_path}")
+        break
+
+if data_file_path is None:
+    print("Error: Preprocessed data file not found. Please run check_data.py for data preprocessing first.")
+    sys.exit(1)
+
+# 1.2 Read preprocessed data
+try:
+    print("Reading preprocessed data...")
+    with open(data_file_path, 'rb') as f:
+        model_data = pickle.load(f)
+    print(f"Data shape: {model_data.shape}")
+    print(f"Data columns: {model_data.columns.tolist()[:5]} ... {model_data.columns.tolist()[-5:]}")
+    
+except Exception as e:
+    print(f"Error reading data file: {str(e)}")
+    sys.exit(1)
+
+# 1.3 Prepare model data
+print("Preparing model training data...")
+
+# Convert survival status to binary label
+if 'SurvivalStatus' in model_data.columns:
+    print("Using SurvivalStatus column as target variable...")
+    model_data['fustat'] = model_data['SurvivalStatus'].map({'Alive': 0, 'Dead': 1})
+    model_data['futime'] = model_data['OS']  # Use OS column as survival time
+elif 'fustat' not in model_data.columns:
+    print("Error: Survival status column not found.")
+    sys.exit(1)
+    
+# Print survival status statistics
+print("Survival status statistics:")
+print(model_data['fustat'].value_counts())
+
+# Extract features
+# Exclude non-feature columns
+exclude_cols = ['fustat', 'futime', 'SurvivalStatus', 'OS', 'TP53_Status', 'CTNNB1_Status', 'RiskGroup', 'PatientID_short']
+feature_cols = [col for col in model_data.columns if col not in exclude_cols]
+X = model_data[feature_cols]
+y = model_data['fustat']
+
+print(f"Number of features: {len(feature_cols)}")
+print(f"Number of samples: {X.shape[0]}")
+print("First 5 feature columns:", feature_cols[:5])
+
+# 2. Split Training and Test Sets
+print("Splitting training and test sets...")
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
+)
+
+print(f"Number of samples in training set: {X_train.shape[0]}")
+print(f"Number of samples in test set: {X_test.shape[0]}")
+
+# Print sample count for each class in training set
+print("Training set survival status statistics:")
+print(y_train.value_counts())
+
+# Print sample count for each class in test set
+print("Test set survival status statistics:")
+print(y_test.value_counts())
+
+# 3. Data Preprocessing
+print("Performing data preprocessing...")
+
+# 3.1 Standardize features
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# 3.2 Handle class imbalance (if necessary)
+# Check class imbalance ratio
+class_counts = y_train.value_counts()
+imbalance_ratio = class_counts[0] / class_counts[1] if class_counts[1] > 0 else float('inf')
+print(f"Class imbalance ratio: {imbalance_ratio:.2f}")
+
+# Use SMOTE if imbalance ratio exceeds 2:1
+use_smote = imbalance_ratio > 2.0 or 1.0 / imbalance_ratio > 2.0
+if use_smote:
+    print("Using SMOTE to handle class imbalance...")
+    smote = SMOTE(random_state=42)
+    X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
+    print(f"Training set size after SMOTE: {X_train_balanced.shape[0]}")
+    print("Training set class distribution after SMOTE:")
+    print(pd.Series(y_train_balanced).value_counts())
+    
+    # Use balanced data
+    X_train_final = X_train_balanced
+    y_train_final = y_train_balanced
+else:
+    print("Class distribution relatively balanced, skipping SMOTE...")
+    X_train_final = X_train_scaled
+    y_train_final = y_train
+
+# 4. Feature Selection
+print("Performing feature selection...")
+
+# 1. Calculate feature importance first, but don't select yet
+feature_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+feature_selector.fit(X_train_final, y_train_final)
+
+# Get feature importance
+importances = feature_selector.feature_importances_
+feature_importance_df = pd.DataFrame({
+    'Feature': feature_cols,
+    'Importance': importances
+})
+feature_importance_df = feature_importance_df.sort_values('Importance', ascending=False)
+
+# 5. Create output directory
+output_dir = "results/survival_prediction_optimized_py"
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    
+print(f"Output directory: {output_dir}")
+
+# Save original feature importance
+feature_importance_csv = os.path.join(output_dir, "1.Original_Feature_Importance.csv")
+feature_importance_df.to_csv(feature_importance_csv, index=False)
+print(f"Saved original feature importance: {feature_importance_csv}")
+
+# 2. Analyze feature correlation and remove redundant features - Do this before feature selection
+print("\nAnalyzing feature correlation first, removing redundant features...")
+X_train_cleaned, cleaned_feature_names, redundant_pairs, corr_matrix = remove_redundant_features(
+    X_train_final, feature_cols, correlation_threshold=0.8, return_pairs=True, return_corr=True
+)
+X_test_cleaned = X_test_scaled[:, [feature_cols.index(f) for f in cleaned_feature_names]]
+
+# Export correlation analysis results to csv
+correlation_csv = os.path.join(output_dir, "2_1.feature_correlation_removed.csv")
+if redundant_pairs:
+    pd.DataFrame(redundant_pairs, columns=["Index", "Removed_Feature", "Paired_With", "Correlation"]).to_csv(correlation_csv, index=False)
+    print(f"Correlation analysis results exported to: {correlation_csv}")
+else:
+    print("No highly correlated features removed, skipping export.")
+
+# Export correlation matrix of all features (original features) to csv
+all_corr_csv = os.path.join(output_dir, "2.all_feature_correlation.csv")
+pd.DataFrame(corr_matrix, index=feature_cols, columns=feature_cols).to_csv(all_corr_csv)
+print(f"Correlation matrix of all features exported to: {all_corr_csv}")
+
+# New: Export correlation matrix of removed redundant features
+removed_features = [x[1] for x in redundant_pairs] if redundant_pairs else []
+if removed_features:
+    # Deduplicate to ensure unique rows/cols
+    removed_features_unique = list(dict.fromkeys(removed_features))
+    removed_corr = pd.DataFrame(corr_matrix, index=feature_cols, columns=feature_cols).loc[removed_features_unique, removed_features_unique]
+    removed_corr_csv = os.path.join(output_dir, "2_1.removed_feature_correlation.csv")
+    removed_corr.to_csv(removed_corr_csv)
+    print(f"Correlation matrix of removed redundant features exported to: {removed_corr_csv}")
+
+# New: Export correlation matrix of finally retained features
+if cleaned_feature_names:
+    cleaned_corr = pd.DataFrame(corr_matrix, index=feature_cols, columns=feature_cols).loc[cleaned_feature_names, cleaned_feature_names]
+    cleaned_corr_csv = os.path.join(output_dir, "2_2.cleaned_feature_correlation.csv")
+    cleaned_corr.to_csv(cleaned_corr_csv)
+    print(f"Correlation matrix of retained features exported to: {cleaned_corr_csv}")
+
+# 3. Recalculate feature importance on cleaned feature set
+print("\nRecalculating feature importance on cleaned feature set...")
+clean_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+clean_selector.fit(X_train_cleaned, y_train_final)
+
+clean_importances = clean_selector.feature_importances_
+clean_indices = np.argsort(clean_importances)[::-1]
+clean_feature_importance_df = pd.DataFrame({
+    'Feature': cleaned_feature_names,
+    'Importance': clean_importances
+}).sort_values('Importance', ascending=False)
+
+# Save cleaned feature importance
+clean_importance_csv = os.path.join(output_dir, "2_2.Cleaned_Feature_Importance.csv")
+clean_feature_importance_df.to_csv(clean_importance_csv, index=False)
+print(f"Saved cleaned feature importance: {clean_importance_csv}")
+
+# 4. Select optimal number of features based on cleaned feature set using cross-validation
+# Calculate cumulative importance
+clean_cumulative_importance = np.cumsum(clean_importances[clean_indices])
+
+def analyze_cleaned_feature_selection(X_train, y_train, X_test, y_test, feature_indices, importances, 
+                            thresholds=[5, 10, 15, 20, 25], cv=5):
+    """
+    Analyze model performance with different number of features and determine optimal number
+    """
+    results = []
+    feature_count = len(feature_indices)
+    # Adjust thresholds to ensure they don't exceed available feature count
+    thresholds = [t for t in thresholds if t <= feature_count]
+    
+    # Create a baseline model for each feature count
+    base_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    
+    # Calculate feature counts at different cumulative importance thresholds
+    importance_thresholds = [0.8, 0.85, 0.9, 0.95]
+    features_at_threshold = []
+    for threshold in importance_thresholds:
+        try:
+            features_needed = np.where(clean_cumulative_importance >= threshold)[0][0] + 1
+            if features_needed <= feature_count:
+                features_at_threshold.append(features_needed)
+        except IndexError:
+            pass  # Skip if condition not met
+    
+    # Merge fixed counts and threshold-based counts
+    all_n_features = sorted(list(set(thresholds + features_at_threshold)))
+    
+    for n_features in all_n_features:
+        if n_features > len(feature_indices):
+            continue
+            
+        selected_indices = feature_indices[:n_features]
+        X_train_selected = X_train[:, selected_indices]
+        X_test_selected = X_test[:, selected_indices]
+        
+        # Cross-validation scores
+        cv_scores = cross_val_score(base_model, X_train_selected, y_train, cv=cv, scoring='roc_auc')
+        
+        # Evaluate on test set
+        model = base_model.fit(X_train_selected, y_train)
+        test_auc = roc_auc_score(y_test, model.predict_proba(X_test_selected)[:, 1])
+        
+        # Calculate cumulative importance for this feature set
+        cumulative_imp = clean_cumulative_importance[n_features-1] if n_features-1 < len(clean_cumulative_importance) else 1.0
+        
+        results.append({
+            'n_features': n_features,
+            'cv_auc_mean': cv_scores.mean(),
+            'cv_auc_std': cv_scores.std(),
+            'test_auc': test_auc,
+            'cumulative_importance': cumulative_imp
+        })
+    
+    return pd.DataFrame(results)
+
+print("\nAnalyzing model performance with different number of features based on cleaned feature set...")
+cleaned_feature_analysis = analyze_cleaned_feature_selection(
+    X_train_cleaned, y_train_final, 
+    X_test_cleaned, y_test,
+    clean_indices, clean_importances
+)
+
+# Save cleaned feature selection analysis results
+clean_feature_analysis_csv = os.path.join(output_dir, "3.Cleaned_Feature_Selection_Analysis.csv")
+cleaned_feature_analysis.to_csv(clean_feature_analysis_csv, index=False)
+print(f"Saved cleaned feature selection analysis results: {clean_feature_analysis_csv}")
+
+# Visualize cleaned feature selection analysis results
+plt.figure(figsize=(12, 8))
+plt.plot(cleaned_feature_analysis['n_features'], cleaned_feature_analysis['cv_auc_mean'], 'b-', label='CV AUC')
+plt.fill_between(cleaned_feature_analysis['n_features'],
+                 cleaned_feature_analysis['cv_auc_mean'] - cleaned_feature_analysis['cv_auc_std'],
+                 cleaned_feature_analysis['cv_auc_mean'] + cleaned_feature_analysis['cv_auc_std'],
+                 alpha=0.2)
+plt.plot(cleaned_feature_analysis['n_features'], cleaned_feature_analysis['test_auc'], 'r--', label='Test AUC')
+plt.xlabel('Number of Features')
+plt.ylabel('AUC Score')
+plt.title('Model Performance vs Number of Features (After Removing Redundancy)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# Add secondary axis for cumulative importance
+ax2 = plt.twinx()
+ax2.plot(cleaned_feature_analysis['n_features'], cleaned_feature_analysis['cumulative_importance'],
+         'g-.', label='Cumulative Importance')
+ax2.set_ylabel('Cumulative Importance')
+ax2.legend(loc='lower right')
+
+# Save chart
+clean_feat_analysis_png = os.path.join(output_dir, "3_1.Cleaned_Feature_Selection_Analysis.png")
+plt.savefig(clean_feat_analysis_png, bbox_inches='tight', dpi=300)
+print(f"Saved cleaned feature selection analysis plot: {clean_feat_analysis_png}")
+plt.close()
+
+# 5. Select optimal feature count based on analysis results
+if not cleaned_feature_analysis.empty:
+    best_n_features = cleaned_feature_analysis.loc[cleaned_feature_analysis['cv_auc_mean'].idxmax(), 'n_features']
+    print(f"\nOptimal feature number based on CV performance: {best_n_features}")
+
+    # Use optimal feature count
+    n_top_features = int(best_n_features)
+    top_feature_indices = clean_indices[:n_top_features]
+    final_selected_features = [cleaned_feature_names[i] for i in top_feature_indices]
+
+    print(f"\nSelected {n_top_features} most important features:")
+    for i, feature in enumerate(final_selected_features[:10]):
+        orig_importance = feature_importance_df[feature_importance_df['Feature'] == feature]['Importance'].values[0]
+        cleaned_importance = clean_feature_importance_df[clean_feature_importance_df['Feature'] == feature]['Importance'].values[0]
+        print(f"{i+1}. {feature} (Orig Importance: {orig_importance:.4f}, Cleaned Importance: {cleaned_importance:.4f})")
+    if n_top_features > 10:
+        print("...")
+
+    # Optimization: Output feature names and importance values
+    selected_features_df = pd.DataFrame({
+        'Feature': final_selected_features,
+        'Importance': clean_importances[top_feature_indices]
+    })
+    selected_features_df = selected_features_df.sort_values('Importance', ascending=False)
+    cv_selected_features_csv = os.path.join(output_dir, "4.cv_selected_features.csv")
+    selected_features_df.to_csv(cv_selected_features_csv, index=False)
+    print(f"CV selected features exported to: {cv_selected_features_csv}")
+
+    # Use selected features
+    X_train_selected = X_train_cleaned[:, top_feature_indices]
+    X_test_selected = X_test_cleaned[:, top_feature_indices]
+    selected_features = final_selected_features
+else:
+    # If analysis result is empty, use all cleaned features
+    print("\nUnable to determine optimal feature count, using all cleaned features")
+    X_train_selected = X_train_cleaned
+    X_test_selected = X_test_cleaned
+    selected_features = cleaned_feature_names
+
+# Execute feature engineering - Move before model training
+print("Executing feature engineering...")
+
+# Redundant features already removed, proceed with selected features
+X_train_enhanced = X_train_selected.copy()
+X_test_enhanced = X_test_selected.copy()
+all_feature_names = selected_features.copy()
+all_feature_importance = []
+
+try:
+    # Define number of interaction features
+    interaction_feature_count = 10
+    X_interactions, interaction_names = create_interaction_features(
+        X_train_selected, selected_features, top_n=interaction_feature_count
+    )
+    
+    if X_interactions is not None and len(interaction_names) > 0:
+        print("\nEvaluating interaction feature importance...")
+        temp_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+        temp_rf.fit(X_interactions, y_train_final)
+        
+        interaction_importance = pd.DataFrame({
+            'Feature': interaction_names,
+            'Importance': temp_rf.feature_importances_
+        }).sort_values('Importance', ascending=False)
+        
+        print("\nInteraction feature importance ranking:")
+        print(interaction_importance)
+        
+        # Select top interaction features
+        top_interactions = interaction_importance.head(interaction_feature_count)
+        selected_indices = interaction_importance.index[:interaction_feature_count]
+        
+        print(f"\nSelecting top {interaction_feature_count} interaction features:")
+        for idx, row in top_interactions.iterrows():
+            print(f"{row['Feature']}: {row['Importance']:.4f}")
+        
+        # Add selected interaction features to training set
+        X_train_enhanced = np.hstack([X_train_selected, X_interactions[:, selected_indices]])
+        
+        # Create same interaction features for test set
+        X_test_interactions, _ = create_interaction_features(
+            X_test_selected, selected_features, top_n=10
+        )
+        if X_test_interactions is not None:
+            X_test_enhanced = np.hstack([X_test_selected, X_test_interactions[:, selected_indices]])
+            
+            # Calculate importance of all features
+            print("\nCalculating importance of final feature set including interaction features...")
+            final_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+            final_rf.fit(X_train_enhanced, y_train_final)
+            
+            # Get original feature importance
+            original_importance = final_rf.feature_importances_[:len(selected_features)]
+            # Get interaction feature importance
+            interaction_importance_values = final_rf.feature_importances_[len(selected_features):]
+            
+            # Combine all feature importance
+            all_feature_importance = original_importance.tolist() + interaction_importance_values.tolist()
+            
+            # Update feature name list
+            all_feature_names.extend([interaction_names[i] for i in selected_indices])
+            print(f"\nNumber of features in final set: {len(all_feature_names)}")
+            print("Final feature list and importance:")
+            for i, (name, importance) in enumerate(zip(all_feature_names, all_feature_importance), 1):
+                print(f"{i}. {name}: {importance:.4f}")
+            
+            # Export final feature list and importance to csv
+            final_feature_list_csv = os.path.join(output_dir, "5.final_feature_list.csv")
+            pd.DataFrame({
+                'Feature': all_feature_names,
+                'Importance': all_feature_importance
+            }).sort_values('Importance', ascending=False).to_csv(final_feature_list_csv, index=False)
+            print(f"Final feature list and importance exported to: {final_feature_list_csv}")
+        else:
+            print("\nWarning: Unable to create interaction features for test set, using original features")
+            # Export original feature list
+            final_feature_list_csv = os.path.join(output_dir, "5.final_feature_list.csv")
+            
+            # Calculate original feature importance
+            final_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+            final_rf.fit(X_train_selected, y_train_final)
+            all_feature_importance = final_rf.feature_importances_
+            
+            pd.DataFrame({
+                'Feature': all_feature_names,
+                'Importance': all_feature_importance
+            }).sort_values('Importance', ascending=False).to_csv(final_feature_list_csv, index=False)
+            print(f"Original feature list and importance exported to: {final_feature_list_csv}")
+    else:
+        print("\nNo interaction features created, using original feature set")
+        # Export original feature list
+        final_feature_list_csv = os.path.join(output_dir, "5.final_feature_list.csv")
+        
+        # Calculate original feature importance
+        final_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+        final_rf.fit(X_train_selected, y_train_final)
+        all_feature_importance = final_rf.feature_importances_
+        
+        pd.DataFrame({
+            'Feature': all_feature_names,
+            'Importance': all_feature_importance
+        }).sort_values('Importance', ascending=False).to_csv(final_feature_list_csv, index=False)
+        print(f"Original feature list and importance exported to: {final_feature_list_csv}")
+except Exception as e:
+    print(f"\nError creating interaction features: {str(e)}")
+    print("Proceeding with cleaned original feature set")
+
+# 3. Evaluate Feature Engineering Effect
+print("\n=== Evaluating Feature Engineering Effect ===")
+print(f"\nOriginal feature count: {len(feature_cols)}")
+print(f"Feature count after redundancy removal: {len(selected_features)}")
+print(f"Feature count after adding interactions: {X_train_enhanced.shape[1]}")
+
+# Create internal validation set to verify model performance (split from enhanced training set)
+X_train_inner, X_val, y_train_inner, y_val = train_test_split(
+    X_train_enhanced, y_train_final, test_size=0.2, random_state=42, stratify=y_train_final
+)
+
+# 4. Model Training and Evaluation
+print("Starting model training and evaluation...")
+
+# Import warnings to handle warnings
+import warnings
+# Filter specific convergence warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.neural_network')
+
+# Modify MLP and SVM model configuration
+models = {
+    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'),
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+    'SVM': SVC(
+        probability=True, 
+        random_state=42,
+        # Increase SVM default gamma range, use more flexible kernel parameters
+        gamma='scale',
+        C=10,
+        kernel='rbf'
+    ),
+    'XGBoost': XGBClassifier(random_state=42),
+    'MLP': MLPClassifier(
+        hidden_layer_sizes=(300, 150, 75, 25),  # Deeper network structure
+        activation='relu',
+        solver='adam',
+        alpha=0.0008,  # Fine-tune regularization
+        max_iter=6000,  # Further increase iterations
+        batch_size=32,  # Keep small batch size to improve learning stability
+        early_stopping=False,  # Continue disabling early stopping
+        learning_rate_init=0.0005,  # Smaller initial learning rate
+        learning_rate='adaptive',  # Keep adaptive learning rate
+        random_state=42,
+        tol=1e-6,  # Increase convergence tolerance
+        shuffle=True  # Ensure samples are shuffled each iteration
+    ),
+    'LightGBM' : LGBMClassifier(
+        n_estimators=200, 
+        learning_rate=0.05, 
+        max_depth=5, 
+        num_leaves=63,
+        reg_alpha=0.1,  # L1 regularization
+        reg_lambda=0.1,  # L2 regularization
+        subsample=0.9,
+        colsample_bytree=0.9,
+        min_child_samples=10,  # Prevent overfitting
+        random_state=42, 
+        verbose=-1
+    ),
+    'CatBoost' : CatBoostClassifier(
+        iterations=200, 
+        learning_rate=0.05, 
+        depth=6,
+        l2_leaf_reg=3,  # Regularization parameter
+        border_count=128,  # Feature border count
+        bagging_temperature=1,  # Bayesian bootstrap strength
+        random_strength=10,  # Randomness strength
+        loss_function='Logloss', 
+        random_seed=42, 
+        verbose=0
+    )
+}
+# Modify hyperparameter search space
+param_grids = {
+    'Logistic Regression': {
+        'C': [0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000],
+        'penalty': ['l2'],
+        'solver': ['liblinear', 'saga']
+    },
+    'Random Forest': {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [None, 10, 20, 30],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
+    },
+    'SVM': {
+        'C': [0.01, 0.1, 1, 10, 50, 100, 500],  # Expand C value range
+        'gamma': [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 'scale', 'auto'],  # Expand gamma value range
+        'kernel': ['rbf', 'linear', 'poly', 'sigmoid'],  # Add poly and sigmoid kernels
+        'degree': [2, 3, 4],  # Degree of poly kernel
+        'coef0': [0.0, 0.1, 0.5]  # Coefficient for poly and sigmoid kernels
+    },
+    'XGBoost': {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [3, 5, 7, 9],
+        'learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'subsample': [0.8, 0.9, 1.0],
+        'colsample_bytree': [0.8, 0.9, 1.0]
+    },
+    'MLP': {
+        'hidden_layer_sizes': [(100,), (200,), (300,), (100, 50), (200, 100), (300, 150, 50), (300, 150, 75, 25), (400, 200, 100, 50)],  # Add deeper networks
+        'activation': ['relu', 'tanh', 'logistic'],  # Add sigmoid activation
+        'alpha': [0.0001, 0.0005, 0.0008, 0.001, 0.005, 0.01],  # Expand regularization parameter range
+        'learning_rate_init': [0.0002, 0.0005, 0.001, 0.002, 0.005],  # Add smaller learning rates
+        'learning_rate': ['constant', 'adaptive', 'invscaling'],
+        'batch_size': [16, 32, 64, 128],
+        'tol': [1e-4, 1e-5, 1e-6, 1e-7]  # Stricter convergence criteria
+    },
+    'LightGBM' : {
+        'n_estimators': [100, 200, 500],
+        'learning_rate': [0.005, 0.01, 0.05, 0.1],
+        'max_depth': [3, 5, 7, 9],
+        'num_leaves': [31, 63, 127],
+        'reg_alpha': [0, 0.1, 0.5, 1.0],  # L1 regularization
+        'reg_lambda': [0, 0.1, 0.5, 1.0],  # L2 regularization
+        'subsample': [0.8, 0.9, 1.0],
+        'colsample_bytree': [0.8, 0.9, 1.0],
+        'min_child_samples': [5, 10, 20, 50]  # Prevent overfitting
+    },
+    'CatBoost' : {
+        'iterations': [200, 500, 1000],
+        'learning_rate': [0.01, 0.03, 0.05, 0.1],
+        'depth': [4, 6, 8, 10],
+        'l2_leaf_reg': [1, 3, 5, 7, 9],  # Regularization
+        'border_count': [32, 128, 254],  # Feature border count
+        'bagging_temperature': [0, 1, 10],  # Bayesian bootstrap strength
+        'random_strength': [1, 10, 100]  # Randomness strength
+    }
+}
+
+# Use random search to optimize hyperparameters
+best_models = {}
+results = {}
+
+for name, model in models.items():
+    print(f"\nTraining and optimizing {name}...")
+    
+    # For simple models, use fewer parameter combinations for efficiency
+    # Increase iterations for SVM as parameter space is significantly expanded
+    if name == 'SVM':
+        n_iter = 30  # SVM needs to explore more parameter combinations
+    elif name in ['Logistic Regression']:
+        n_iter = 10
+    else:
+        n_iter = 20
+    
+    random_search = RandomizedSearchCV(
+        model,
+        param_distributions=param_grids[name],
+        n_iter=n_iter,
+        cv=5,
+        scoring='roc_auc',
+        n_jobs=-1,
+        random_state=42,
+        verbose=0
+    )
+    
+    # Train model using enhanced feature set
+    random_search.fit(X_train_enhanced, y_train_final)
+    
+    # Save best model
+    best_models[name] = random_search.best_estimator_
+    
+    # Predict on test set
+    y_pred = best_models[name].predict(X_test_enhanced)
+    y_pred_proba = best_models[name].predict_proba(X_test_enhanced)[:, 1]
+    
+    # Calculate and record performance metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, zero_division=1)
+    recall = recall_score(y_test, y_pred, zero_division=1)
+    f1 = f1_score(y_test, y_pred, zero_division=1)
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    
+    # Calculate confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    
+    results[name] = {
+        'model': best_models[name],
+        'best_params': random_search.best_params_,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'roc_auc': roc_auc,
+        'confusion_matrix': cm,
+        'y_pred': y_pred,
+        'y_pred_proba': y_pred_proba
+    }
+    
+    # Evaluate and record performance on training set
+    train_y_pred = best_models[name].predict(X_train_enhanced)
+    train_y_pred_proba = best_models[name].predict_proba(X_train_enhanced)[:, 1]
+    
+    train_accuracy = accuracy_score(y_train_final, train_y_pred)
+    train_precision = precision_score(y_train_final, train_y_pred, zero_division=1)
+    train_recall = recall_score(y_train_final, train_y_pred, zero_division=1)
+    train_f1 = f1_score(y_train_final, train_y_pred, zero_division=1)
+    train_roc_auc = roc_auc_score(y_train_final, train_y_pred_proba)
+    
+    # Add training and test results to results dictionary separately
+    results[f"{name}_Train"] = {
+                    'accuracy': train_accuracy,
+                    'precision': train_precision,
+                    'recall': train_recall,
+        'f1_score': train_f1,
+        'auc': train_roc_auc
+    }
+    
+    results[f"{name}_Test"] = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'auc': roc_auc
+    }
+    
+    print(f"\n{name} Best params:")
+    print(random_search.best_params_)
+    print(f"\n{name} Performance metrics:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"ROC AUC: {roc_auc:.4f}")
+    
+    print("\nConfusion Matrix:")
+    print(cm)
+
+
+
+# 9. Create and train ensemble models using best models
+print("\nCreating and training ensemble models...")
+
+# Create and train ensemble models
+def create_and_train_ensemble_models(X_train, y_train, X_test, y_test, best_models, results_dict, output_dir):
+    """Create and train ensemble models, ensure using enhanced feature set, and add results to results dictionary"""
+    print("\nCreating and training ensemble models...")
+    
+    # Get best performing models
+    model_performance = {}
+    for name, model in best_models.items():
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(y_test, y_pred_proba)
+        model_performance[name] = auc
+    
+    # Select models with AUC above threshold - lower threshold to include more models
+    auc_threshold = 0.7  # Lowered from 0.7 to 0.65
+    good_models = [name for name, auc in model_performance.items() if auc >= auc_threshold]
+    
+    if len(good_models) < 2:
+        # If not enough good models, select top 3 best
+        good_models = sorted(model_performance, key=model_performance.get, reverse=True)[:3]  # Increased from 2 to 3
+    
+    print(f"Selected the following models for ensemble: {', '.join(good_models)}")
+    
+    # 1. Create and train voting classifier
+    voting_estimators = [(name, best_models[name]) for name in good_models]
+    voting_weights = [model_performance[name] for name in good_models]  # Use AUC as weights
+    
+    vote_clf = VotingClassifier(
+        estimators=voting_estimators,
+        voting='soft',
+        weights=voting_weights
+    )
+    
+    print("Training voting classifier...")
+    vote_clf.fit(X_train, y_train)
+    
+    # 2. Create and train stacking classifier
+    print("Training stacking classifier...")
+    
+    # Use best performing model as meta-learner
+    best_model_name = max(model_performance, key=model_performance.get)
+    meta_learner = best_models[best_model_name]
+    print(f"Using {best_model_name} as meta-learner for stacking classifier")
+    
+    stack_clf = StackingClassifier(
+        estimators=voting_estimators,
+        final_estimator=meta_learner,
+        cv=5
+    )
+    stack_clf.fit(X_train, y_train)
+    
+    # Add to ensemble_models and return
+    ensemble_models = {
+        'VotingClassifier': vote_clf,
+        'StackingClassifier': stack_clf
+    }
+    
+    # Evaluate ensemble models and add results to results dictionary
+    for name, model in ensemble_models.items():
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+        
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, zero_division=1)
+        recall = recall_score(y_test, y_pred, zero_division=1)
+        f1 = f1_score(y_test, y_pred, zero_division=1)
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        cm = confusion_matrix(y_test, y_pred)
+        
+        # Add ensemble model results to results dictionary
+        results_dict[name] = {
+            'model': model,
+            'best_params': {'ensemble': 'true'},  # Ensemble models don't have traditional best_params
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'roc_auc': roc_auc,
+            'confusion_matrix': cm,
+            'y_pred': y_pred,
+            'y_pred_proba': y_pred_proba
+        }
+        
+        print(f"\n{name} Performance metrics:")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        print(f"ROC AUC: {roc_auc:.4f}")
+        
+        # Calculate ensemble model performance on training set
+        y_train_pred = model.predict(X_train)
+        y_train_pred_proba = model.predict_proba(X_train)[:, 1]
+        
+        train_accuracy = accuracy_score(y_train, y_train_pred)
+        train_precision = precision_score(y_train, y_train_pred, zero_division=1)
+        train_recall = recall_score(y_train, y_train_pred, zero_division=1)
+        train_f1 = f1_score(y_train, y_train_pred, zero_division=1)
+        train_roc_auc = roc_auc_score(y_train, y_train_pred_proba)
+        
+        # Add training results to train_results dictionary
+        results_dict[f"{name}_Train"] = {
+            'accuracy': train_accuracy,
+            'precision': train_precision,
+            'recall': train_recall,
+            'f1_score': train_f1,
+            'auc': train_roc_auc
+        }
+        
+        # Also add test results to separate key for consistency
+        results_dict[f"{name}_Test"] = {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'auc': roc_auc
+        }
+        
+        print(f"\n{name} Performance on training set:")
+        print(f"Accuracy: {train_accuracy:.4f}")
+        print(f"Precision: {train_precision:.4f}")
+        print(f"Recall: {train_recall:.4f}")
+        print(f"F1 Score: {train_f1:.4f}")
+        print(f"ROC AUC: {train_roc_auc:.4f}")
+        
+    return ensemble_models
+
+# 10. Train Ensemble Models
+print("\n10. Train Ensemble Models")
+# Ensure using enhanced feature set (X_train_enhanced)
+ensemble_models = create_and_train_ensemble_models(X_train_enhanced, y_train_final, X_test_enhanced, y_test, best_models, results, output_dir)
+
+# Save best ensemble model
+best_ensemble_model_name = None
+best_ensemble_auc = 0
+for name, model in ensemble_models.items():
+    y_pred_proba = model.predict_proba(X_test_enhanced)[:, 1]
+    ensemble_auc = roc_auc_score(y_test, y_pred_proba)
+    if ensemble_auc > best_ensemble_auc:
+        best_ensemble_auc = ensemble_auc
+        best_ensemble_model_name = name
+
+if best_ensemble_model_name:
+    print(f"\nBest ensemble model: {best_ensemble_model_name}, AUC: {best_ensemble_auc:.4f}")
+    
+    # Add best ensemble model to best models dictionary
+    best_models[best_ensemble_model_name] = ensemble_models[best_ensemble_model_name]
+    
+    # Save best ensemble model
+    best_ensemble_model_path = os.path.join(output_dir, f"best_ensemble_model_{best_ensemble_model_name}.pkl")
+    with open(best_ensemble_model_path, 'wb') as f:
+        pickle.dump(ensemble_models[best_ensemble_model_name], f)
+    print(f"Best ensemble model saved to: {best_ensemble_model_path}")
+
+# 11. Feature Importance Analysis
+if 'Random Forest' in best_models:
+    print("\nFeature importance analysis (based on Random Forest)...")
+    rf_model = best_models['Random Forest']
+    feature_importances = pd.DataFrame({
+        'Feature': all_feature_names,
+        'Importance': rf_model.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    print("\nFeature importance ranking:")
+    print(feature_importances)
+    
+    # Plot feature importance
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x='Importance', y='Feature', data=feature_importances.head(15))
+    plt.title('Top 15 Most Important Features for Survival Prediction')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/1_1.figure6_survival_feature_importance.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+# 7. Plot ROC curves for each model and export data
+plt.figure(figsize=(10, 8))
+import pandas as pd
+roc_curve_rows = []
+all_model_names = [name for name in results.keys() if not name.endswith('_Train') and not name.endswith('_Test')]
+for name in all_model_names:
+    if 'y_pred_proba' in results[name]:
+        fpr, tpr, thresholds = roc_curve(y_test, results[name]['y_pred_proba'])
+        auc = results[name]["roc_auc"]
+        plt.plot(fpr, tpr, lw=2, label=f'{name} (AUC = {auc:.4f})')
+        for i in range(len(fpr)):
+            roc_curve_rows.append({
+                'Model': name,
+                'FPR': fpr[i],
+                'TPR': tpr[i],
+                'Threshold': thresholds[i] if i < len(thresholds) else None,
+                'AUC': auc
+            })
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve for Survival Prediction Models')
+plt.legend(loc="lower right")
+plt.savefig(f"{output_dir}/5_1.figure6_survival_roc_curves.png", dpi=300, bbox_inches='tight')
+plt.close()
+# Export ROC curve data
+roc_curve_df = pd.DataFrame(roc_curve_rows)
+roc_curve_csv = os.path.join(output_dir, "5.figure6_survival_roc_curve_data.csv")
+roc_curve_df.to_csv(roc_curve_csv, index=False)
+print(f"ROC curve data saved to: {roc_curve_csv}")
+
+# 7.1 Plot PR curves for each model and export data
+from sklearn.metrics import precision_recall_curve, average_precision_score
+plt.figure(figsize=(10, 8))
+pr_curve_rows = []
+for name in all_model_names:
+    if 'y_pred_proba' in results[name]:
+        precision, recall, thresholds = precision_recall_curve(y_test, results[name]['y_pred_proba'])
+        avg_precision = average_precision_score(y_test, results[name]['y_pred_proba'])
+        plt.plot(recall, precision, lw=2, label=f'{name} (AP = {avg_precision:.4f})')
+        for i in range(len(precision)):
+            pr_curve_rows.append({
+                'Model': name,
+                'Precision': precision[i],
+                'Recall': recall[i],
+                'Threshold': thresholds[i-1] if i > 0 and i-1 < len(thresholds) else None,
+                'AP': avg_precision
+            })
+plt.plot([0, 1], [sum(y_test)/len(y_test)] * 2, 'k--', lw=1, label='Random Model')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('PR Curve for Survival Prediction Models')
+plt.legend(loc="lower left")
+plt.savefig(f"{output_dir}/6_1.figure6_survival_pr_curves.png", dpi=300, bbox_inches='tight')
+plt.close()
+# Export PR curve data
+pr_curve_df = pd.DataFrame(pr_curve_rows)
+pr_curve_csv = os.path.join(output_dir, "6.figure6_survival_pr_curve_data.csv")
+pr_curve_df.to_csv(pr_curve_csv, index=False)
+print(f"PR curve data saved to: {pr_curve_csv}")
+
+# 8. Compare Model Performance
+all_model_names = [name for name in results.keys() 
+                  if not name.endswith('_Train') and not name.endswith('_Test')]
+metrics = ['accuracy', 'precision', 'recall', 'f1_score', 'roc_auc']
+comparison_data = {metric: [results[name][metric] for name in all_model_names] for metric in metrics}
+
+# Create performance comparison table
+performance_df = pd.DataFrame(comparison_data, index=all_model_names)
+print("\nAll model performance comparison:")
+print(performance_df)
+
+# Save performance metrics to CSV
+performance_csv = os.path.join(output_dir, "7.model_performance_test.csv")
+performance_df.to_csv(performance_csv)
+print(f"Model performance data saved to: {performance_csv}")
+
+# Plot performance comparison chart
+plt.figure(figsize=(14, 8))  # Increase chart width to accommodate more models
+performance_df.plot(kind='bar', figsize=(15, 8))
+plt.title('Comparison of Different Models on Survival Prediction Task')
+plt.ylabel('Score')
+plt.xticks(rotation=30)  # Rotate labels to prevent overlap
+plt.ylim(0, 1.0)
+plt.legend(loc='lower right')
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.tight_layout()  # Ensure all elements are displayed correctly
+plt.savefig(f"{output_dir}/7_1.figure6_survival_model_comparison.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# Modify training set performance table creation code
+train_model_names = [name.replace('_Train', '') for name in results.keys() if name.endswith('_Train')]
+train_comparison_data = {
+    metric: [results[f"{name}_Train"][metric if metric != 'roc_auc' else 'auc'] 
+            for name in train_model_names] 
+    for metric in metrics
+}
+train_performance_df = pd.DataFrame(train_comparison_data, index=train_model_names)
+
+# Save training set performance to CSV
+train_performance_csv = os.path.join(output_dir, "8.model_performance_train.csv")
+train_performance_df.to_csv(train_performance_csv)
+print(f"Training set model performance data saved to: {train_performance_csv}")
+
+# Modify training vs test set performance comparison
+models_with_both = train_model_names
+
+# Create comparison data
+comparison_fig, axes = plt.subplots(len(metrics), 1, figsize=(14, 4*len(metrics)))
+for i, metric in enumerate(metrics):
+    metric_key = 'auc' if metric == 'roc_auc' else metric
+    train_values = [results[f"{name}_Train"][metric_key] for name in models_with_both]
+    test_values = [results[f"{name}_Test"][metric_key] for name in models_with_both]
+    
+    df = pd.DataFrame({
+        'Train': train_values,
+        'Test': test_values
+    }, index=models_with_both)
+    
+    ax = axes[i]
+    df.plot(kind='bar', ax=ax)
+    ax.set_title(f'{metric.capitalize()} Train vs Test')
+    ax.set_ylim(0, 1.05)
+    ax.grid(axis='y', alpha=0.3)
+    ax.set_xlabel('')
+    ax.tick_params(axis='x', rotation=30)  # Rotate labels to prevent overlap
+    
+plt.tight_layout()
+plt.savefig(f"{output_dir}/9.train_test_performance_comparison.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+# Save training vs test comparison data
+train_test_comparison = {}
+for name in models_with_both:
+    train_test_comparison[name] = {
+        f"{metric}_train": results[f"{name}_Train"][metric_key] 
+        for metric in metrics
+    }
+    train_test_comparison[name].update({
+        f"{metric}_test": results[f"{name}_Test"][metric_key] 
+        for metric in metrics
+    })
+
+train_test_df = pd.DataFrame(train_test_comparison).T
+train_test_csv = os.path.join(output_dir, "9.train_test_comparison.csv")
+train_test_df.to_csv(train_test_csv)
+print(f"Training vs test comparison data saved to: {train_test_csv}")
+
+# Modify confusion matrix heatmap generation code to ensure ensemble models are included
+print("\nGenerating Confusion Matrix Heatmap...")
+for name in all_model_names:
+    if 'confusion_matrix' in results[name]:
+        cm = results[name]['confusion_matrix']
+        
+        # Save confusion matrix as csv
+        cm_df = pd.DataFrame(cm, index=["Survived", "Died"], columns=["Survived", "Died"])
+        cm_df.to_csv(f"{output_dir}/10._{name}_confusion_matrix.csv")
+        
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", 
+                    xticklabels=["Survived", "Died"],
+                    yticklabels=["Survived", "Died"])
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.title(f'{name} - Confusion Matrix')
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/{name}_confusion_matrix.png", dpi=300, bbox_inches='tight')
+        plt.close()
+
+# Modify model comparison radar chart
+print("\nGenerating Model Performance Radar Chart...")
+metrics_for_radar = ['accuracy', 'precision', 'recall', 'f1_score', 'roc_auc']
+metrics_names = ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'ROC AUC']
+
+# Create radar chart
+fig = plt.figure(figsize=(12, 10))  # Increase chart size to accommodate more models
+ax = fig.add_subplot(111, polar=True)
+
+# Set angles
+angles = np.linspace(0, 2*np.pi, len(metrics_for_radar), endpoint=False).tolist()
+angles += angles[:1]  # Close radar chart
+
+# Prepare data
+for name in all_model_names:
+    if all(metric in results[name] for metric in metrics_for_radar):
+        values = [results[name][metric] for metric in metrics_for_radar]
+        values += values[:1]  # Close radar chart
+        
+        ax.plot(angles, values, linewidth=2, label=name)
+        ax.fill(angles, values, alpha=0.1)
+
+# Set labels and axes
+ax.set_xticks(angles[:-1])
+ax.set_xticklabels(metrics_names)
+ax.set_ylim(0, 1)
+plt.title('Model Performance Radar Chart Comparison')
+plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))  # Adjust legend position
+plt.tight_layout()
+plt.savefig(f"{output_dir}/11.model_performance_radar.png", dpi=300, bbox_inches='tight')
+plt.close()
+
+print("\n===== Survival prediction analysis completed =====")
+print(f"Output files saved in: {output_dir}/")
