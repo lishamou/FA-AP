@@ -1274,3 +1274,4449 @@ log_message("    - Figure2F_Cox_Forest_Data.csv\n", print_to_console = TRUE)
 log_message("Analysis complete!\n", print_to_console = TRUE)
 
 log_message(paste0("Figure 2A drawing complete! Results saved in ", output_dir, " directory\n"), print_to_console = TRUE)
+
+##############################################################################
+
+#!/usr/bin/env Rscript
+
+# Figure 3: Differences in agent activity profiles between prognostic risk groups
+# Based on design in plan.md
+
+# 0. Set up log file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure3.log")
+log_con <- file(log_file, "w")
+
+# Define log output function
+log_message <- function(message, print_to_console = FALSE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Ensure log file closes on exit
+on.exit({
+  close(log_con)
+  log_message(paste0("\nLog saved to: ", normalizePath(log_file), "\n"), print_to_console = TRUE)
+})
+
+# 0. Load necessary R packages
+# Assumes all necessary packages are installed in the conda environment
+
+# Define required packages
+required_packages <- c("GSVA", "ggplot2", "dplyr", "tidyr", "readxl", "openxlsx",
+                      "reshape2", "ggpubr", "patchwork")
+
+# Load packages only, do not attempt installation
+for (pkg in required_packages) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  log_message(paste0("Loading package: ", pkg, "\n"))
+}
+
+# 1. Prepare data
+# 1.1 Load previously generated GSVA score data
+log_message("Loading previously generated GSVA score data...\n", print_to_console = TRUE)
+
+# Try different paths to find data files
+results_paths <- c(
+  "results",                      # Relative to current directory
+  "./results",                    # Relative to code directory
+  "../results",                   # Relative to parent directory
+  file.path(getwd(), "results"),  # Absolute path
+  file.path(dirname(getwd()), "results") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_results_path <- NULL
+for (path in results_paths) {
+  if (dir.exists(path) &&
+      file.exists(file.path(path, "gsva_scores.rds")) &&
+      file.exists(file.path(path, "patient_metadata.rds"))) {
+    existing_results_path <- path
+    log_message(paste0("Found data directory: ", existing_results_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_results_path)) {
+  stop("Error: Previously generated data files not found. Please run figure2.R script first.")
+}
+
+# Read data files
+gsva_scores_tcga <- readRDS(file.path(existing_results_path, "gsva_scores.rds"))
+patient_metadata <- readRDS(file.path(existing_results_path, "patient_metadata.rds"))
+
+# 1.2 Read risk score data
+log_message("Reading risk score data...\n", print_to_console = TRUE)
+
+# Try different paths to find risk score data file
+risk_score_paths <- c(
+  "data/The risk score of each patient.xlsx",          # Relative to current directory
+  "../data/The risk score of each patient.xlsx",       # Relative to code directory
+  file.path(getwd(), "data/The risk score of each patient.xlsx"), # Absolute path
+  file.path(dirname(getwd()), "data/The risk score of each patient.xlsx") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_risk_score_path <- NULL
+for (path in risk_score_paths) {
+  if (file.exists(path)) {
+    existing_risk_score_path <- path
+    log_message(paste0("Found risk score data file: ", existing_risk_score_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_risk_score_path)) {
+  stop("Error: Cannot find risk score data file 'The risk score of each patient.xlsx'. Please ensure the file exists in the 'data' directory.")
+}
+
+# Read risk score data file
+risk_score_data <- read.xlsx(existing_risk_score_path)
+
+# Print risk score data column names for debugging
+log_message(paste0("Risk score data column names: ", paste(colnames(risk_score_data), collapse = ", "), "\n"))
+
+# 1.3 Assign risk groups to TCGA samples based on risk score data
+log_message("Assigning risk groups to TCGA samples...\n", print_to_console = TRUE)
+
+# Identify sample ID and risk score columns
+sample_id_col <- NULL
+risk_score_col <- NULL
+
+# Try to find sample ID column
+for (col in colnames(risk_score_data)) {
+  if (any(grepl("TCGA-", risk_score_data[[col]]))) {
+    sample_id_col <- col
+    log_message(paste0("Using sample ID column from risk score data: ", sample_id_col, "\n"))
+    break
+  }
+}
+
+# Try to find risk score column
+possible_score_cols <- c("risk_score", "Risk_Score", "RS", "score", "Score")
+for (col in colnames(risk_score_data)) {
+  if (col %in% possible_score_cols || grepl("score|Score|risk|Risk", col)) {
+    risk_score_col <- col
+    log_message(paste0("Using risk score column from risk score data: ", risk_score_col, "\n"))
+    break
+  }
+}
+
+# If no suitable column found, use first column as sample ID and second as risk score
+if (is.null(sample_id_col)) {
+  sample_id_col <- colnames(risk_score_data)[1]
+  log_message(paste0("No explicit sample ID column found, using first column: ", sample_id_col, "\n"))
+}
+if (is.null(risk_score_col)) {
+  risk_score_col <- colnames(risk_score_data)[2]
+  log_message(paste0("No explicit risk score column found, using second column: ", risk_score_col, "\n"))
+}
+
+# Extract sample ID and risk score
+risk_data <- data.frame(
+  SampleID = risk_score_data[[sample_id_col]],
+  RiskScore = as.numeric(risk_score_data[[risk_score_col]])
+)
+
+# Ensure consistent sample ID format (use first 12 characters, i.e., TCGA-XX-XXXX format)
+risk_data$SampleID_short <- substr(risk_data$SampleID, 1, 12)
+
+# Calculate median risk score for grouping
+risk_median <- median(risk_data$RiskScore, na.rm = TRUE)
+log_message(paste0("Risk score median: ", risk_median, "\n"))
+
+# Assign risk groups based on median
+risk_data$RiskGroup <- ifelse(risk_data$RiskScore > risk_median, "High", "Low")
+log_message(paste0("Number of High risk samples: ", sum(risk_data$RiskGroup == "High", na.rm = TRUE), "\n"), print_to_console = TRUE)
+log_message(paste0("Number of Low risk samples: ", sum(risk_data$RiskGroup == "Low", na.rm = TRUE), "\n"), print_to_console = TRUE)
+
+# 1.4 Match risk group info with GSVA score data
+log_message("Matching risk group info with GSVA score data...\n")
+
+# Extract GSVA sample IDs (first 12 characters)
+gsva_samples_short <- substr(colnames(gsva_scores_tcga), 1, 12)
+
+# Create match table
+match_indices <- match(gsva_samples_short, risk_data$SampleID_short)
+
+# Get risk group info
+risk_groups <- risk_data$RiskGroup[match_indices]
+names(risk_groups) <- colnames(gsva_scores_tcga)
+
+# Handle unmatched samples
+risk_groups[is.na(risk_groups)] <- "Unknown"
+
+# Extract High and Low risk samples
+high_risk_samples <- colnames(gsva_scores_tcga)[risk_groups == "High"]
+low_risk_samples <- colnames(gsva_scores_tcga)[risk_groups == "Low"]
+
+log_message(paste0("Number of High risk samples in GSVA data: ", length(high_risk_samples), "\n"), print_to_console = TRUE)
+log_message(paste0("Number of Low risk samples in GSVA data: ", length(low_risk_samples), "\n"), print_to_console = TRUE)
+
+# 2. Prepare plot data
+log_message("Preparing plot data...\n")
+
+# 2.1 Read all signatures from signature.csv
+log_message("Reading all signatures from signature.csv...\n", print_to_console = TRUE)
+
+# Try different paths to find signature file
+signature_paths <- c(
+  "data/signature.csv",                      # Relative to current directory
+  "../data/signature.csv",                   # Relative to code directory
+  file.path(getwd(), "data/signature.csv"),  # Absolute path
+  file.path(dirname(getwd()), "data/signature.csv") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_signature_path <- NULL
+for (path in signature_paths) {
+  if (file.exists(path)) {
+    existing_signature_path <- path
+    log_message(paste0("Found signature file: ", existing_signature_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_signature_path)) {
+  stop("Error: Cannot find signature file 'signature.csv'. Please ensure the file exists in the 'data' directory.")
+}
+
+# Read signature file
+signature_data <- read.csv(existing_signature_path, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+log_message(paste0("Successfully read ", nrow(signature_data), " gene set signatures\n"), print_to_console = TRUE)
+
+# 2.2 Prepare long format data frame for TCGA data
+prepare_long_data <- function(gsva_scores, high_samples, low_samples, cohort_name) {
+  # Extract GSVA scores for High and Low risk samples
+  high_risk_scores <- gsva_scores[, high_samples, drop = FALSE]
+  low_risk_scores <- gsva_scores[, low_samples, drop = FALSE]
+
+  # Convert to long format
+  high_risk_long <- reshape2::melt(high_risk_scores, varnames = c("AgentState", "SampleID"),
+                                  value.name = "Score")
+  high_risk_long$RiskGroup <- "High"
+  high_risk_long$Cohort <- cohort_name
+
+  low_risk_long <- reshape2::melt(low_risk_scores, varnames = c("AgentState", "SampleID"),
+                                 value.name = "Score")
+  low_risk_long$RiskGroup <- "Low"
+  low_risk_long$Cohort <- cohort_name
+
+  # Combine High and Low risk data
+  combined_long <- rbind(high_risk_long, low_risk_long)
+
+  # Ensure RiskGroup is a factor and set order (Low first, then High)
+  combined_long$RiskGroup <- factor(combined_long$RiskGroup, levels = c("Low", "High"))
+
+  return(combined_long)
+}
+
+# Prepare TCGA data
+tcga_long_data <- prepare_long_data(gsva_scores_tcga, high_risk_samples, low_risk_samples, "TCGA-LIHC")
+
+# 4. Save data
+log_message("Saving data...\n")
+
+# Create output directory
+output_dir <- existing_results_path
+
+# Save risk group comparison data as CSV
+log_message("Saving risk group comparison data...\n")
+
+# Calculate mean score for each state in different risk groups
+risk_group_means <- tcga_long_data %>%
+  group_by(AgentState, RiskGroup) %>%
+  summarize(Mean_Score = mean(Score, na.rm = TRUE),
+            SD_Score = sd(Score, na.rm = TRUE),
+            N = n(),
+            .groups = "drop")
+
+# Calculate p-values
+risk_group_pvals <- data.frame(
+  AgentState = character(),
+  P_Value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (state in unique(tcga_long_data$AgentState)) {
+  state_data <- tcga_long_data[tcga_long_data$AgentState == state, ]
+  if (length(unique(state_data$RiskGroup)) >= 2) {
+    p_val <- tryCatch({
+      wilcox.test(Score ~ RiskGroup, data = state_data)$p.value
+    }, error = function(e) {
+      NA
+    })
+    risk_group_pvals <- rbind(risk_group_pvals, data.frame(AgentState = state, P_Value = p_val))
+  }
+}
+
+# Convert mean data to wide format
+risk_group_means_wide <- risk_group_means %>%
+  pivot_wider(id_cols = AgentState,
+              names_from = RiskGroup,
+              values_from = c(Mean_Score, SD_Score, N))
+
+# Merge means and p-values
+risk_group_results <- left_join(risk_group_means_wide, risk_group_pvals, by = "AgentState")
+
+# Save results
+risk_group_csv <- file.path(output_dir, "Figure3_Risk_Group_Comparison.csv")
+write.csv(risk_group_results, risk_group_csv, row.names = FALSE)
+log_message(paste0("Saved risk group comparison data table: ", risk_group_csv, "\n"))
+
+# Save long format data (for plotting)
+long_data_csv <- file.path(output_dir, "Figure3_Risk_Group_Long_Format.csv")
+write.csv(tcga_long_data, long_data_csv, row.names = FALSE)
+log_message(paste0("Saved risk group long format data table: ", long_data_csv, "\n"))
+
+##########################################################################################
+
+#!/usr/bin/env Rscript
+
+# Figure 3 Key Comparison: Displaying the most significant differences in agent activity between high and low risk groups
+
+# 0. Set up log file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure3_key_comparison.log")
+log_con <- file(log_file, "w")
+
+# Define log output function
+log_message <- function(message, print_to_console = FALSE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Load necessary packages
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(reshape2)
+
+# Set output directory
+output_dir <- "./results"
+
+# Read data
+risk_group_comparison <- read.csv(file.path(output_dir, "Figure3_Risk_Group_Comparison.csv"))
+risk_group_long_format <- read.csv(file.path(output_dir, "Figure3_Risk_Group_Long_Format.csv"))
+
+# Sort agent states by p-value
+risk_group_comparison <- risk_group_comparison %>%
+  arrange(P_Value)
+
+# Select the top 6 most significant states
+top_states <- head(risk_group_comparison$AgentState, 6)
+cat("The 6 most significant agent states:\n", paste(top_states, collapse = "\n"), "\n")
+
+# Select representative states in risk groups
+# Major biological processes enriched in high-risk group
+high_risk_enriched <- c(
+  "CSC_Activity_PRG",                     # Cancer Stem Cell Activity
+  "Autophagy_Endothelial_HighRisk_AutRG", # Autophagy and Endothelial related
+  "CytokineSignaling_HighRisk_CSIRG",     # Cytokine Signaling Pathway
+  "KEGG_HOMOLOGOUS_RECOMBINATION",        # Homologous Recombination
+  "KEGG_CELL_CYCLE",                      # Cell Cycle
+  "KEGG_DNA_REPLICATION"                  # DNA Replication
+)
+
+# Major biological processes enriched in low-risk group
+low_risk_enriched <- c(
+  "KEGG_COMPLEMENT_AND_COAGULATION_CASCADES", # Complement and Coagulation Cascades
+  "LipidMetabolism_Risk_LMRG",                # Lipid Metabolism
+  "KEGG_FATTY_ACID_METABOLISM",               # Fatty Acid Metabolism
+  "KEGG_PRIMARY_BILE_ACID_BIOSYNTHESIS",      # Primary Bile Acid Biosynthesis
+  "Mast_cells",                               # Mast cells
+  "B_cells"                                   # B cells
+)
+
+# Combine both groups of states
+key_states <- c(high_risk_enriched, low_risk_enriched)
+
+# Ensure uniqueness
+key_states <- unique(key_states)
+
+# Filter long format data to include only selected states
+filtered_data <- risk_group_long_format %>%
+  filter(AgentState %in% key_states)
+
+# Create boxplot + violin plot for each selected state
+create_comparison_plot <- function(data, state_name) {
+  # Extract current state's data
+  state_data <- data[data$AgentState == state_name, ]
+  
+  # Calculate p-value
+  p_val <- tryCatch({
+    wilcox.test(Score ~ RiskGroup, data = state_data)$p.value
+  }, error = function(e) {
+    cat("Warning: Unable to calculate p-value for", state_name, ":", e$message, "\n")
+    return(NA)
+  })
+  
+  # Format p-value text
+  if (is.na(p_val)) {
+    p_text <- "p = NA"
+  } else if (p_val < 0.001) {
+    p_text <- "p < 0.001"
+  } else if (p_val < 0.01) {
+    p_text <- paste0("p = ", sprintf("%.3f", p_val))
+  } else {
+    p_text <- paste0("p = ", sprintf("%.3f", p_val))
+  }
+  
+  # Calculate y-axis position for p-value annotation
+  y_max <- max(state_data$Score, na.rm = TRUE)
+  y_min <- min(state_data$Score, na.rm = TRUE)
+  y_range <- y_max - y_min
+  y_pos <- y_max + 0.1 * y_range
+  
+  # Use original name directly, no mapping
+  display_name <- state_name
+  
+  # Set colors for risk groups based on enrichment type
+  high_risk_colors <- c("Low" = "#2C7BB6", "High" = "#D7191C")
+  low_risk_colors <- c("Low" = "#9ab55e", "High" = "#bd7cb3")
+  
+  # Determine if this state is enriched in high or low risk group
+  enriched_in <- ifelse(state_name %in% high_risk_enriched, "High Risk", "Low Risk")
+  
+  # Select color scheme based on state type
+  if (state_name %in% high_risk_enriched) {
+    risk_colors <- high_risk_colors
+  } else {
+    risk_colors <- low_risk_colors
+  }
+  
+  # Create ggplot object
+  p <- ggplot(state_data, aes(x = RiskGroup, y = Score, fill = RiskGroup)) +
+    geom_violin(trim = FALSE, alpha = 0.5) +
+    geom_boxplot(width = 0.15, fill = "white", outlier.shape = NA) +
+    scale_fill_manual(values = risk_colors) +
+    # Format y-axis numbers to 1 decimal place
+    scale_y_continuous(labels = function(x) sprintf("%.1f", x)) +
+    labs(
+      title = display_name,
+      x = NULL,  # Remove x-axis title
+      y = "Activity Score (GSVA)"
+    ) +
+    theme_classic(base_size = 13) +
+    theme(
+      legend.position = "none",
+      # Set all text to black
+      text = element_text(color = "black"),
+      # Reduce title font size to 12
+      plot.title = element_text(hjust = 0.5, size = 12, face = "bold", color = "black"),
+      axis.text.x = element_text(angle = 0, hjust = 0.5, face = "bold", size = 12, color = "black"),
+      axis.text.y = element_text(size = 12, color = "black"),
+      axis.title.x = element_blank(),  # Remove x-axis title
+      axis.title.y = element_text(face = "bold", size = 12, color = "black"),
+      axis.line = element_line(color = "black"),
+      panel.border = element_rect(colour = "black", fill = NA)
+    ) +
+    scale_x_discrete(labels = c("Low" = "Low Risk", "High" = "High Risk")) +
+    annotate("text", x = 1.5, y = y_pos, label = p_text, size = 5, color = "black")
+  
+  return(p)
+}
+
+# Create plots for each state
+plot_list <- list()
+for (state in key_states) {
+  cat("Drawing plot for", state, "...\n")
+  plot_list[[state]] <- create_comparison_plot(filtered_data, state)
+}
+
+# Create two subplots for high risk and low risk enriched states
+high_risk_plots <- plot_list[high_risk_enriched]
+low_risk_plots <- plot_list[low_risk_enriched]
+
+# Use gridExtra to combine plots
+cat("Saving plots for high risk enriched states...\n")
+
+# Export high-risk group data
+high_risk_data <- filtered_data %>%
+  filter(AgentState %in% high_risk_enriched) %>%
+  select(AgentState, RiskGroup, Score, Cohort) %>%
+  arrange(AgentState, RiskGroup)
+write.csv(high_risk_data, file.path(output_dir, "Figure3A_HighRisk_Enriched_Data.csv"), row.names = FALSE)
+cat("Saved high risk enriched data to CSV\n")
+
+# High risk enriched plots
+high_risk_pdf <- file.path(output_dir, "Figure3A_HighRisk_Enriched_Combined.pdf")
+pdf(high_risk_pdf, width = 12, height = 8)
+grid.arrange(grobs = high_risk_plots, ncol = 3)
+dev.off()
+
+
+cat("Saving plots for low risk enriched states...\n")
+
+# Export low-risk group data
+low_risk_data <- filtered_data %>%
+  filter(AgentState %in% low_risk_enriched) %>%
+  select(AgentState, RiskGroup, Score, Cohort) %>%
+  arrange(AgentState, RiskGroup)
+write.csv(low_risk_data, file.path(output_dir, "Figure3B_LowRisk_Enriched_Data.csv"), row.names = FALSE)
+cat("Saved low risk enriched data to CSV\n")
+
+# Low risk enriched plots
+low_risk_pdf <- file.path(output_dir, "Figure3B_LowRisk_Enriched_Combined.pdf")
+pdf(low_risk_pdf, width = 12, height = 8)
+grid.arrange(grobs = low_risk_plots, ncol = 3)
+dev.off()
+
+cat("Combined plots have been saved to", output_dir, "directory\n")
+
+########################################################################
+
+
+#!/usr/bin/env Rscript
+
+# Figure 4: Functional association patterns within the agent functional state activity profile
+# Based on plan.md design
+
+# 0. Set up log file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure4.log")
+log_con <- file(log_file, "w")
+
+# Define log output function
+log_message <- function(message, print_to_console = FALSE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Ensure log file closes on exit
+on.exit({
+  close(log_con)
+  log_message(paste0("\nLog saved to: ", normalizePath(log_file), "\n"), print_to_console = TRUE)
+})
+
+# 0. Load necessary R packages
+# Assumes all necessary packages are installed in the conda environment
+
+# Define required packages
+required_packages <- c("pheatmap", "RColorBrewer", "Hmisc", "igraph",
+                      "dplyr", "tidyr")
+
+# Load packages only, do not attempt installation
+for (pkg in required_packages) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  log_message(paste0("Loading package: ", pkg, "\n"))
+}
+
+# 1. Prepare data
+# 1.1 Load previously generated GSVA score data
+log_message("Loading previously generated GSVA score data...\n", print_to_console = TRUE)
+
+# Try different paths to find data files
+results_paths <- c(
+  "results",                      # Relative to current directory
+  "../results",                   # Relative to code directory
+  file.path(getwd(), "results"),  # Absolute path
+  file.path(dirname(getwd()), "results") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_results_path <- NULL
+for (path in results_paths) {
+  if (dir.exists(path) &&
+      file.exists(file.path(path, "gsva_scores.rds")) &&
+      file.exists(file.path(path, "patient_metadata.rds"))) {
+    existing_results_path <- path
+    log_message(paste0("Found data directory: ", existing_results_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_results_path)) {
+  stop("Error: Previously generated data files not found. Please run figure2.R script first.")
+}
+
+# Create output directory
+output_dir <- existing_results_path
+# Check if output directory exists, create if not
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  # Log creation message
+  log_message(paste0("Created output directory: ", output_dir, "\n"), print_to_console = TRUE)
+}
+
+# Read data files
+gsva_scores_tcga <- readRDS(file.path(existing_results_path, "gsva_scores.rds"))
+patient_metadata <- readRDS(file.path(existing_results_path, "patient_metadata.rds"))
+
+# 2. Calculate correlation matrix
+log_message("Calculating Spearman correlation between agent states...\n", print_to_console = TRUE)
+
+# 2.1 Calculate Spearman correlation matrix and P-value matrix
+# Hmisc::rcorr requires columns to be variables, so transpose first
+gsva_scores_t <- t(gsva_scores_tcga)
+cor_results <- rcorr(gsva_scores_t, type = "spearman")
+
+# Extract correlation coefficient matrix (rho) and P-value matrix
+cor_matrix <- cor_results$r
+pval_matrix <- cor_results$P
+
+# Print correlation matrix dimensions
+log_message(paste0("Correlation matrix dimensions: ", paste(dim(cor_matrix), collapse = " x "), "\n"))
+log_message(paste0("Agent states in correlation matrix: ", paste(rownames(cor_matrix), collapse = ", "), "\n"))
+
+# 3. Plot correlation matrix heatmap (Figure 4A)
+log_message("Plotting correlation matrix heatmap (Figure 4A)...\n", print_to_console = TRUE)
+
+# 3.1 Define colors
+cor_colors <- colorRampPalette(rev(brewer.pal(n = 9, name = "RdBu")))(100)
+
+# 3.2 Plot heatmap
+# Using correlation as clustering distance usually works better
+p_heatmap <- pheatmap(
+  cor_matrix,
+  color = cor_colors,
+  clustering_distance_rows = "correlation", # Use 1-cor as distance
+  clustering_distance_cols = "correlation",
+  border_color = "grey60", # Can be "white" or NA
+  fontsize_row = 8,        # Adjust font size
+  fontsize_col = 8,
+  main = "Spearman Correlation Matrix of Agent State Activities (TCGA)",
+  treeheight_row = 30, # Adjust clustering tree height
+  treeheight_col = 30
+)
+
+# 3.3 Get clustered order and save corresponding correlation matrix data
+# Get row/column order after clustering (same for symmetric matrix)
+clustered_order <- p_heatmap$tree_row$order
+clustered_labels <- rownames(cor_matrix)[clustered_order]
+
+# Reorder correlation matrix based on clustering order
+cor_matrix_clustered <- cor_matrix[clustered_order, clustered_order]
+pval_matrix_clustered <- pval_matrix[clustered_order, clustered_order]
+
+# Convert clustered correlation matrix to long format data frame
+cor_data_clustered <- reshape2::melt(cor_matrix_clustered, 
+                                    varnames = c("State1", "State2"), 
+                                    value.name = "Correlation")
+
+# Convert clustered p-value matrix to long format data frame
+pval_data_clustered <- reshape2::melt(pval_matrix_clustered, 
+                                     varnames = c("State1", "State2"), 
+                                     value.name = "P_Value")
+
+# Merge correlation and p-value data
+cor_results_clustered_df <- merge(cor_data_clustered, pval_data_clustered, 
+                                 by = c("State1", "State2"))
+
+# Add significance label
+cor_results_clustered_df$Significant <- ifelse(cor_results_clustered_df$P_Value < 0.05, 
+                                              "Yes", "No")
+
+# Save clustered complete correlation data
+cor_results_clustered_csv <- file.path(output_dir, "Figure4A_Correlation_Matrix_Clustered.csv")
+write.csv(cor_results_clustered_df, cor_results_clustered_csv, row.names = FALSE)
+log_message(paste0("Saved clustered correlation data table: ", cor_results_clustered_csv, "\n"))
+
+# Save raw matrix format correlation data (not converted to long table)
+cor_matrix_raw_csv <- file.path(output_dir, "Figure4A_Correlation_Matrix_Raw.csv") # Raw data for Figure4A_Correlation_Heatmap.pdf
+write.csv(cor_matrix_clustered, cor_matrix_raw_csv)
+log_message(paste0("Saved raw matrix format correlation data: ", cor_matrix_raw_csv, "\n"))
+
+# Save raw matrix format P-value data (not converted to long table)
+pval_matrix_raw_csv <- file.path(output_dir, "Figure4A_PValue_Matrix_Raw.csv") # Raw data for Figure4A_Correlation_Heatmap.pdf
+write.csv(pval_matrix_clustered, pval_matrix_raw_csv)
+log_message(paste0("Saved raw matrix format P-value data: ", pval_matrix_raw_csv, "\n"))
+
+# Save clustered significant correlations (p < 0.05)
+sig_cor_results_clustered <- cor_results_clustered_df[cor_results_clustered_df$P_Value < 0.05, ]
+sig_cor_results_clustered <- sig_cor_results_clustered[order(abs(sig_cor_results_clustered$Correlation), 
+                                                           decreasing = TRUE), ]
+sig_cor_clustered_csv <- file.path(output_dir, "Figure4A_Significant_Correlations_Clustered.csv")
+write.csv(sig_cor_results_clustered, sig_cor_clustered_csv, row.names = FALSE)
+log_message(paste0("Saved clustered significant correlation data table: ", sig_cor_clustered_csv, "\n"))
+
+# Save clustering order
+clustering_order_df <- data.frame(
+  Order = 1:length(clustered_labels),
+  State = clustered_labels
+)
+clustering_order_csv <- file.path(output_dir, "Figure4A_Clustering_Order.csv")
+write.csv(clustering_order_df, clustering_order_csv, row.names = FALSE)
+log_message(paste0("Saved clustering order: ", clustering_order_csv, "\n"))
+
+# Extract hierarchical clustering information
+# Get clustering tree from pheatmap object
+tree <- p_heatmap$tree_row
+
+# Get first and second level clusters
+# First level clustering (larger groups)
+k1 <- 2  # First level divided into 2 groups
+first_level_clusters <- cutree(tree, k = k1)
+
+# Second level clustering (smaller groups)
+k2 <- 4  # Second level divided into 4 groups
+second_level_clusters <- cutree(tree, k = k2)
+
+# Create data frame containing two levels of clustering info
+clustering_hierarchy_df <- data.frame(
+  State = names(first_level_clusters),
+  Level1_Cluster = paste("Cluster", first_level_clusters),
+  Level2_Cluster = paste("Cluster", second_level_clusters)
+)
+
+# Organize data by cluster groups
+# Level 1 cluster groups
+level1_groups <- split(clustering_hierarchy_df$State, clustering_hierarchy_df$Level1_Cluster)
+level1_df <- data.frame(
+  Cluster = names(level1_groups),
+  States = sapply(level1_groups, paste, collapse = ", ")
+)
+
+# Level 2 cluster groups
+level2_groups <- split(clustering_hierarchy_df$State, clustering_hierarchy_df$Level2_Cluster)
+level2_df <- data.frame(
+  Cluster = names(level2_groups),
+  States = sapply(level2_groups, paste, collapse = ", ")
+)
+
+# Combine two levels of data into one data frame
+hierarchy_summary <- data.frame(
+  Hierarchy_Level = c(rep("Level1", nrow(level1_df)), rep("Level2", nrow(level2_df))),
+  rbind(level1_df, level2_df)
+)
+
+# Save hierarchical clustering info
+hierarchy_csv <- file.path(output_dir, "Figure4A_Clustering_Hierarchy.csv")
+write.csv(hierarchy_summary, hierarchy_csv, row.names = FALSE)
+log_message(paste0("Saved hierarchical clustering info: ", hierarchy_csv, "\n"))
+
+# 3.4 Save heatmap
+# Save heatmap
+output_pdf <- file.path(output_dir, "Figure4A_Correlation_Heatmap.pdf") # Included in article figure
+
+# Use pdf function to save directly
+pdf(output_pdf, width = 16, height = 14)
+print(p_heatmap)
+dev.off()
+
+
+log_message(paste0("Saved correlation heatmap: ", output_pdf, "\n"), print_to_console = TRUE)
+
+# 4. Create correlation network plot (Figure 4B)
+log_message("Creating correlation network plot (Figure 4B)...\n", print_to_console = TRUE)
+
+# 4.1 Create adjacency matrix based on thresholds
+rho_threshold <- 0.3 # Correlation coefficient threshold (absolute value)
+pval_threshold <- 0.05 # P-value threshold
+original_rho_threshold <- rho_threshold
+
+# Log thresholds
+log_message(paste0("Using correlation threshold |rho| > ", rho_threshold, " and P-value threshold p < ", pval_threshold, " to create network\n"), print_to_console = TRUE)
+
+# Create a binary adjacency matrix based on thresholds
+adj_matrix <- ifelse(abs(cor_matrix) > rho_threshold & pval_matrix < pval_threshold, 1, 0)
+diag(adj_matrix) <- 0 # Remove self-loops
+
+# Check if there are enough edges, if not, progressively lower threshold
+if (sum(adj_matrix) == 0) {
+  log_message("Warning: No significant correlations found at current threshold, attempting to lower threshold automatically...\n", print_to_console = TRUE)
+  
+  # Try lower thresholds
+  threshold_attempts <- c(0.25, 0.2, 0.15, 0.1, 0.05)
+  for (new_threshold in threshold_attempts) {
+    log_message(paste0("Trying threshold |rho| > ", new_threshold, "...\n"), print_to_console = TRUE)
+    adj_matrix <- ifelse(abs(cor_matrix) > new_threshold & pval_matrix < pval_threshold, 1, 0)
+    diag(adj_matrix) <- 0
+    if (sum(adj_matrix) > 0) {
+      rho_threshold <- new_threshold
+      log_message(paste0("Found valid threshold: |rho| > ", rho_threshold, ", total ", sum(adj_matrix), " edges\n"), print_to_console = TRUE)
+      break
+    }
+  }
+}
+
+# 4.2 Create igraph object
+# Create two graph objects: one for layout (using absolute value weights), one for display (keeping original weight signs)
+
+# Create absolute value correlation matrix for layout
+adj_matrix_abs <- abs(adj_matrix)
+
+# Create graph object for layout using absolute value matrix
+layout_graph <- graph_from_adjacency_matrix(adj_matrix_abs, mode = "undirected", diag = FALSE, weighted = TRUE)
+
+# Create graph object for display using original matrix
+graph_obj <- graph_from_adjacency_matrix(adj_matrix, mode = "undirected", diag = FALSE)
+
+# 4.3 Add edge attributes (correlation strength and sign)
+# Get list of existing edges
+edge_list <- as_edgelist(graph_obj, names = TRUE)
+
+# Check if there are edges
+if (nrow(edge_list) > 0) {
+  # Extract correlation values for these edges
+  edge_weights <- apply(edge_list, 1, function(edge) cor_matrix[edge[1], edge[2]])
+
+  # Add attributes
+  tryCatch({
+    E(graph_obj)$weight <- edge_weights
+    E(graph_obj)$sign <- ifelse(edge_weights > 0, "Positive", "Negative")
+    E(graph_obj)$abs_weight <- abs(edge_weights) # For edge width
+  }, error = function(e) {
+    log_message(paste0("Error setting edge attributes: ", e$message, "\n"), print_to_console = TRUE)
+  })
+  
+  # Check if graph object is valid
+  if (is.null(graph_obj) || vcount(graph_obj) == 0 || ecount(graph_obj) == 0) {
+    log_message("Warning: Created network graph is empty or invalid.\n", print_to_console = TRUE)
+    log_message("Please try lowering correlation threshold or p-value threshold.\n", print_to_console = TRUE)
+  } else {
+    # 4.4 Add node attributes (e.g., node degree)
+    tryCatch({
+      V(graph_obj)$degree <- degree(graph_obj)
+      # Ensure degree is a numeric vector
+      if (!is.numeric(V(graph_obj)$degree) || any(is.na(V(graph_obj)$degree))) {
+        log_message("Warning: Node degree anomaly, repairing...\n", print_to_console = TRUE)
+        # Replace NA and non-numeric with 0
+        temp_degree <- V(graph_obj)$degree
+        temp_degree[is.na(temp_degree)] <- 0
+        V(graph_obj)$degree <- as.numeric(temp_degree)
+      }
+    }, error = function(e) {
+      log_message(paste0("Error calculating node degree: ", e$message, "\n"), print_to_console = TRUE)
+      V(graph_obj)$degree <- rep(1, vcount(graph_obj)) # Use default degree
+    })
+
+    # 4.5 Plot network using igraph
+    set.seed(123) # Ensure reproducible layout
+
+    # Set node size based on degree, but significantly reduce overall size
+    # Add type check and error handling
+    tryCatch({
+      # Ensure degree is numeric
+      if(!is.numeric(V(graph_obj)$degree)) {
+        log_message("Warning: Node degree is not numeric, attempting conversion...\n", print_to_console = TRUE)
+        V(graph_obj)$degree <- as.numeric(V(graph_obj)$degree)
+      }
+      V(graph_obj)$size <- 0.5 + (V(graph_obj)$degree * 0.2)  # Further reduce node size
+    }, error = function(e) {
+      log_message(paste0("Error setting node size: ", e$message, "\n"), print_to_console = TRUE)
+      log_message("Using default size instead.\n", print_to_console = TRUE)
+      V(graph_obj)$size <- rep(3, vcount(graph_obj))  # Use default size
+    })
+
+    # Set node color based on degree
+    # Use gradient color, from light to dark
+    tryCatch({
+      degree_range <- range(V(graph_obj)$degree)
+      if(degree_range[1] == degree_range[2]) {
+        # If all nodes have same degree, use same color
+        V(graph_obj)$color <- rep("lightblue", vcount(graph_obj))
+      } else {
+        V(graph_obj)$color <- colorRampPalette(c("lightblue", "darkblue"))(101)[1 + floor(100 * (V(graph_obj)$degree - degree_range[1]) / (degree_range[2] - degree_range[1] + 0.01))]
+      }
+    }, error = function(e) {
+      log_message(paste0("Error setting node color: ", e$message, "\n"), print_to_console = TRUE)
+      log_message("Using default color instead.\n", print_to_console = TRUE)
+      V(graph_obj)$color <- rep("lightblue", vcount(graph_obj))  # Use default color
+    })
+
+    # Set edge color based on correlation sign
+    # Use semi-transparent colors to reduce visual clutter
+    tryCatch({
+      E(graph_obj)$color <- ifelse(E(graph_obj)$sign == "Positive", "#FF000080", "#0000FF80")
+    }, error = function(e) {
+      log_message(paste0("Error setting edge color: ", e$message, "\n"), print_to_console = TRUE)
+      log_message("Using default color instead.\n", print_to_console = TRUE)
+      E(graph_obj)$color <- rep("#888888", ecount(graph_obj))  # Use default grey
+    })
+
+    # Set edge width based on correlation strength, but reduce overall width
+    tryCatch({
+      E(graph_obj)$width <- 0.5 + (E(graph_obj)$abs_weight * 2)  # Reduce edge width
+    }, error = function(e) {
+      log_message(paste0("Error setting edge width: ", e$message, "\n"), print_to_console = TRUE)
+      log_message("Using default width instead.\n", print_to_console = TRUE)
+      E(graph_obj)$width <- rep(1, ecount(graph_obj))  # Use default width
+    })
+
+    # Use layout algorithm more suitable for large networks
+    # Try different layout algorithms
+    if (vcount(graph_obj) > 30) {
+      # For large networks, use Fruchterman-Reingold algorithm
+      # Use layout_graph (absolute weights) to calculate layout
+      layout <- layout_with_fr(layout_graph, niter = 500)
+    } else {
+      # For small networks, keep circle layout
+      layout <- layout_in_circle(graph_obj)
+    }
+
+    # Create network plot object
+    # Adjust label size based on node count
+    label_cex <- if (vcount(graph_obj) > 30) 0.5 else 1.2  # Adjust label size
+    label_dist <- if (vcount(graph_obj) > 30) 1.0 else 0.7  # Increase label distance
+    edge_curved <- if (vcount(graph_obj) > 30) 0.3 else 0.2  # Adjust edge curvature
+
+    network_plot <- plot(graph_obj,
+                         layout = layout,
+                         vertex.label = V(graph_obj)$name,
+                         vertex.label.cex = label_cex,  # Adjust label size
+                         vertex.label.color = "black",
+                         vertex.label.dist = label_dist,  # Increase label distance
+                         vertex.label.family = "sans",
+                         vertex.frame.color = NA,  # Remove node border
+                         edge.curved = edge_curved,  # Adjust edge curvature
+                         main = "Correlation Network of Agent States")
+
+    # 4.6 Save network plot
+    output_pdf <- file.path(output_dir, "Figure4B_Correlation_Network.pdf")
+
+    # Define function to plot and save network
+    plot_and_save_network <- function(graph, layout, output_pdf, title, width = 12, height = 12) {
+      # Use pdf function to save directly
+      pdf(output_pdf, width = width, height = height)  # Further increase figure size
+      plot(graph,
+           layout = layout,
+           vertex.label = V(graph)$name,
+           vertex.label.cex = label_cex,
+           vertex.label.color = "black",
+           vertex.label.dist = label_dist,
+           vertex.label.family = "sans",
+           vertex.frame.color = NA,  # Remove node border
+           edge.curved = edge_curved,
+           main = title)
+      dev.off()
+
+      log_message(paste0("Saved correlation network plot: ", output_pdf, "\n"))
+    }
+
+    # 1. Save main network plot (using FR layout)
+    plot_and_save_network(
+      graph_obj,
+      layout,
+      output_pdf,
+      "Correlation Network of Agent States (FR Layout)"
+    )
+
+    # 2. Use other layout algorithms and save
+    # Use Kamada-Kawai layout (on absolute value graph)
+    if (vcount(graph_obj) > 5) {  # KK layout requires at least 5 nodes
+      tryCatch({
+        kk_layout <- layout_with_kk(layout_graph)
+        kk_output_pdf <- file.path(output_dir, "Figure4B_Correlation_Network_KK.pdf")
+        plot_and_save_network(
+          graph_obj,
+          kk_layout,
+          kk_output_pdf,
+          "Correlation Network of Agent States (KK Layout)"
+        )
+      }, error = function(e) {
+        log_message(paste0("Warning: Cannot use Kamada-Kawai layout: ", e$message, "\n"))
+      })
+    }
+
+    # Use Multidimensional Scaling layout (MDS)
+    tryCatch({
+      mds_layout <- layout_with_mds(layout_graph)
+      mds_output_pdf <- file.path(output_dir, "Figure4B_Correlation_Network_MDS.pdf")
+      plot_and_save_network(
+        graph_obj,
+        mds_layout,
+        mds_output_pdf,
+        "Correlation Network of Agent States (MDS Layout)"
+      )
+    }, error = function(e) {
+      log_message(paste0("Warning: Cannot use MDS layout: ", e$message, "\n"))
+    })
+
+    # Use Circle layout
+    circle_layout <- layout_in_circle(graph_obj)
+    circle_output_pdf <- file.path(output_dir, "Figure4B_Correlation_Network_Circle.pdf")
+    plot_and_save_network(
+      graph_obj,
+      circle_layout,
+      circle_output_pdf,
+      "Correlation Network of Agent States (Circle Layout)"
+    )
+
+    log_message(paste0("Saved correlation network plot: ", output_pdf, "\n"), print_to_console = TRUE)
+
+    # Save network data as CSV table
+    log_message("Saving network data...\n")
+
+    # Save node data
+    nodes_data <- data.frame(
+      State = V(graph_obj)$name,
+      Degree = V(graph_obj)$degree,
+      Size = V(graph_obj)$size
+    )
+    nodes_csv <- file.path(output_dir, "Figure4B_Network_Nodes.csv")
+    write.csv(nodes_data, nodes_csv, row.names = FALSE)
+    log_message(paste0("Saved network node data table: ", nodes_csv, "\n"))
+
+    # Save edge data
+    edges_data <- data.frame(
+      State1 = edge_list[, 1],
+      State2 = edge_list[, 2],
+      Correlation = E(graph_obj)$weight,
+      Sign = E(graph_obj)$sign,
+      Abs_Weight = E(graph_obj)$abs_weight,
+      Width = E(graph_obj)$width
+    )
+    edges_csv <- file.path(output_dir, "Figure4B_Network_Edges.csv")
+    write.csv(edges_data, edges_csv, row.names = FALSE)
+    log_message(paste0("Saved network edge data table: ", edges_csv, "\n"))
+  }
+} else {
+  log_message(paste0("Warning: No significant correlations found at threshold |rho| > ", rho_threshold, " and p < ", pval_threshold, ".\n"), print_to_console = TRUE)
+  log_message("Please try lowering correlation threshold or p-value threshold.\n", print_to_console = TRUE)
+}
+
+log_message(paste0("Figure 4 complete! Results saved in ", output_dir, " directory\n"), print_to_console = TRUE)
+
+################################################################################
+
+#!/usr/bin/env Rscript
+# =======================================
+# figure4_highlight.R
+# 
+# Optimize Figure 4 visualization to highlight key findings
+# Highlight important network nodes and connections
+# =======================================
+
+# Set character encoding
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+# Create log directory and file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+
+log_file <- file.path(log_dir, "figure4_highlight.log")
+log_con <- file(log_file, open = "w", encoding = "UTF-8")
+
+# Log function
+write_log <- function(message) {
+  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  log_message <- paste0("[", timestamp, "] ", message)
+  cat(log_message, "\n", file = log_con, append = TRUE)
+  cat(log_message, "\n")
+}
+
+# Error handling function
+handle_error <- function(e, message) {
+  error_msg <- paste0("Error: ", message, " - ", conditionMessage(e))
+  write_log(error_msg)
+  return(NULL)
+}
+
+write_log("Starting execution of figure4_highlight.R script")
+write_log("Loading necessary R packages")
+
+# Load necessary packages
+required_packages <- c("pheatmap", "RColorBrewer", "Hmisc", "igraph", 
+                       "dplyr", "tidyr", "ggplot2", "viridis")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    write_log(paste0("Installing missing package: ", pkg))
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# Set working directory and results directory
+base_dir <- getwd()
+results_dir <- file.path(base_dir, "results")
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir, recursive = TRUE)
+  write_log("Creating results directory")
+}
+
+# Get path to previous analysis results
+existing_results_path <- file.path(results_dir)
+write_log(paste0("Using results path: ", existing_results_path))
+
+# Check if necessary files exist
+correlation_matrix_file <- file.path(existing_results_path, "Figure4A_Correlation_Matrix_Clustered.csv")
+network_nodes_file <- file.path(existing_results_path, "Figure4B_Network_Nodes.csv")
+network_edges_file <- file.path(existing_results_path, "Figure4B_Network_Edges.csv")
+
+if (!file.exists(correlation_matrix_file)) {
+  write_log(paste0("Warning: Correlation matrix file not found: ", correlation_matrix_file))
+  write_log("Please run the original figure4.R script first to generate base data files")
+  stop("Missing necessary data files")
+}
+
+if (!file.exists(network_nodes_file) || !file.exists(network_edges_file)) {
+  write_log(paste0("Warning: Network graph files not found: ", network_nodes_file, " or ", network_edges_file))
+  write_log("Please run the original figure4.R script first to generate base data files")
+  stop("Missing necessary data files")
+}
+
+# Load correlation matrix and network data
+write_log("Loading previous analysis results")
+
+correlation_matrix <- tryCatch({
+  # Fix reading method, do not set row names
+  read.csv(correlation_matrix_file)
+}, error = function(e) {
+  write_log(paste0("Error: Reading correlation matrix file - ", conditionMessage(e)))
+  return(NULL)
+})
+
+network_nodes <- tryCatch({
+  read.csv(network_nodes_file)
+}, error = function(e) {
+  write_log(paste0("Error: Reading network nodes file - ", conditionMessage(e)))
+  return(NULL)
+})
+
+network_edges <- tryCatch({
+  read.csv(network_edges_file)
+}, error = function(e) {
+  write_log(paste0("Error: Reading network edges file - ", conditionMessage(e)))
+  return(NULL)
+})
+
+# Check if data loading was successful
+if (is.null(correlation_matrix) || is.null(network_nodes) || is.null(network_edges)) {
+  write_log("Error: Failed to load necessary data files, script will exit")
+  stop("Data loading failed")
+}
+
+# Check network node column names
+if (!"State" %in% colnames(network_nodes)) {
+  # Try to fix column names
+  if ("node" %in% colnames(network_nodes)) {
+    network_nodes$State <- network_nodes$node
+  } else {
+    write_log("Warning: Network node data format unexpected, attempting to rename first column to State")
+    names(network_nodes)[1] <- "State"
+  }
+}
+
+# Check network edge column names
+if (!all(c("State1", "State2") %in% colnames(network_edges))) {
+  # Try to fix column names
+  if (all(c("from", "to") %in% colnames(network_edges))) {
+    network_edges$State1 <- network_edges$from
+    network_edges$State2 <- network_edges$to
+  } else {
+    write_log("Warning: Network edge data format unexpected, attempting to rename first two columns to State1 and State2")
+    names(network_edges)[1:2] <- c("State1", "State2")
+  }
+}
+
+# Define key nodes
+write_log("Defining key nodes")
+
+# Cluster 1: Metabolism related pathways
+cluster1_nodes <- c(
+  "KEGG_PRIMARY_BILE_ACID_BIOSYNTHESIS",
+  "KEGG_RETINOL_METABOLISM",
+  "KEGG_DRUG_METABOLISM_CYTOCHROME_P450",
+  "KEGG_GLYCINE_SERINE_AND_THREONINE_METABOLISM",
+  "KEGG_FATTY_ACID_METABOLISM"
+)
+
+# Cluster 2: Cell Cycle and DNA Repair related pathways
+cluster2_nodes <- c(
+  "KEGG_CELL_CYCLE",
+  "KEGG_PURINE_METABOLISM",
+  "KEGG_RNA_DEGRADATION",
+  "KEGG_MISMATCH_REPAIR",
+  "KEGG_SPLICEOSOME"
+)
+
+# Cluster 3: Signal Transduction related pathways
+cluster3_nodes <- c(
+  "KEGG_ENDOCYTOSIS",
+  "KEGG_VEGF_SIGNALING_PATHWAY",
+  "KEGG_NOD_LIKE_RECEPTOR_SIGNALING_PATHWAY",
+  "KEGG_MAPK_SIGNALING_PATHWAY",
+  "Treg"
+)
+
+# Cluster 4: Immune Response related pathways
+cluster4_nodes <- c(
+  "APC_co_stimulation",
+  "KEGG_CHEMOKINE_SIGNALING_PATHWAY",
+  "KEGG_JAK_STAT_SIGNALING_PATHWAY",
+  "CCR",
+  "KEGG_ANTIGEN_PROCESSING_AND_PRESENTATION"
+)
+
+# Combine all key nodes
+all_key_nodes <- unique(c(
+  cluster1_nodes,
+  cluster2_nodes,
+  cluster3_nodes,
+  cluster4_nodes
+))
+
+write_log(paste0("Defined ", length(all_key_nodes), " key nodes"))
+write_log("Cluster 1 (Metabolism related pathways):")
+for (node in cluster1_nodes) {
+  write_log(paste0("  - ", node))
+}
+write_log("Cluster 2 (Cell Cycle and DNA Repair related pathways):")
+for (node in cluster2_nodes) {
+  write_log(paste0("  - ", node))
+}
+write_log("Cluster 3 (Signal Transduction related pathways):")
+for (node in cluster3_nodes) {
+  write_log(paste0("  - ", node))
+}
+write_log("Cluster 4 (Immune Response related pathways):")
+for (node in cluster4_nodes) {
+  write_log(paste0("  - ", node))
+}
+
+# Check if defined nodes exist in the data
+missing_nodes <- all_key_nodes[!all_key_nodes %in% network_nodes$State]
+if (length(missing_nodes) > 0) {
+  write_log(paste0("Warning: The following nodes do not exist in network data: ", paste(missing_nodes, collapse = ", ")))
+  # Remove non-existent nodes from key nodes list
+  all_key_nodes <- all_key_nodes[all_key_nodes %in% network_nodes$State]
+}
+
+# If no key nodes exist in the data, use nodes with highest degree in the network as key nodes
+if (length(all_key_nodes) == 0) {
+  write_log("Warning: None of the predefined key nodes are in the network. Automatically selecting nodes with highest degree.")
+  
+  # Check if network node data contains degree info
+  if ("Degree" %in% colnames(network_nodes)) {
+    # Sort nodes by degree in descending order
+    sorted_nodes <- network_nodes[order(network_nodes$Degree, decreasing = TRUE), ]
+    # Take top 10 nodes with highest degree
+    high_degree_nodes <- sorted_nodes$State[1:min(10, nrow(sorted_nodes))]
+    write_log(paste0("Automatically selected high degree nodes: ", paste(high_degree_nodes, collapse = ", ")))
+    
+    # Update all key nodes list
+    all_key_nodes <- high_degree_nodes
+  } else {
+    write_log("Error: No degree information in network node data, cannot automatically select key nodes")
+    stop("Missing key node information")
+  }
+}
+
+# Add cluster info to network_nodes dataframe
+network_nodes$Cluster <- NA
+network_nodes$Cluster[network_nodes$State %in% cluster1_nodes] <- "Cluster 1: Metabolism"
+network_nodes$Cluster[network_nodes$State %in% cluster2_nodes] <- "Cluster 2: Cell Cycle & DNA Repair"
+network_nodes$Cluster[network_nodes$State %in% cluster3_nodes] <- "Cluster 3: Signal Transduction"
+network_nodes$Cluster[network_nodes$State %in% cluster4_nodes] <- "Cluster 4: Immune Response"
+
+# Filter key edges (keep only connections between key nodes)
+key_edges <- network_edges[network_edges$State1 %in% all_key_nodes & 
+                          network_edges$State2 %in% all_key_nodes, ]
+
+write_log(paste0("Filtered ", nrow(key_edges), " key edges"))
+
+# If not enough key edges, relax conditions to keep edges where at least one node is a key node
+if (nrow(key_edges) < 5 && length(all_key_nodes) > 0) {
+  write_log("Warning: Too few key edges, relaxing filter conditions")
+  key_edges <- network_edges[network_edges$State1 %in% all_key_nodes | 
+                             network_edges$State2 %in% all_key_nodes, ]
+  write_log(paste0("Filtered ", nrow(key_edges), " key edges after relaxing conditions"))
+}
+
+# Create correlation bar plot for specified pathway pairs
+write_log("Creating correlation bar plot for specified pathway pairs")
+
+# Define specified pathway pairs
+specified_pairs <- data.frame(
+  State1 = c(
+    "KEGG_CELL_CYCLE",
+    "KEGG_MAPK_SIGNALING_PATHWAY",
+    "APC_co_stimulation",
+    "KEGG_FATTY_ACID_METABOLISM",
+    "KEGG_CELL_CYCLE",
+    "KEGG_CELL_CYCLE",
+    "Treg"
+  ),
+  State2 = c(
+    "KEGG_RNA_DEGRADATION",
+    "Treg",
+    "KEGG_CHEMOKINE_SIGNALING_PATHWAY",
+    "KEGG_PRIMARY_BILE_ACID_BIOSYNTHESIS",
+    "Treg",
+    "KEGG_FATTY_ACID_METABOLISM",
+    "KEGG_FATTY_ACID_METABOLISM"
+  )
+)
+
+# Read existing correlation data
+correlations_file <- file.path(existing_results_path, "Figure4A_Significant_Correlations_Clustered.csv")
+if (!file.exists(correlations_file)) {
+  write_log(paste0("Error: Correlation data file not found: ", correlations_file))
+  stop("Missing correlation data file")
+}
+
+# Read correlation data
+all_correlations <- read.csv(correlations_file)
+write_log(paste0("Read ", nrow(all_correlations), " correlation records from file"))
+
+# Extract correlations for specified pathway pairs
+top_correlations <- data.frame(
+  node1 = character(),
+  node2 = character(),
+  correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:nrow(specified_pairs)) {
+  pair1 <- specified_pairs[i, ]
+  # Forward search
+  corr_data <- all_correlations[all_correlations$State1 == pair1$State1 & 
+                               all_correlations$State2 == pair1$State2, ]
+  if (nrow(corr_data) == 0) {
+    # Reverse search
+    corr_data <- all_correlations[all_correlations$State1 == pair1$State2 & 
+                                 all_correlations$State2 == pair1$State1, ]
+  }
+  
+  if (nrow(corr_data) > 0) {
+    top_correlations <- rbind(top_correlations, 
+                             data.frame(
+                               node1 = pair1$State1,
+                               node2 = pair1$State2,
+                               correlation = corr_data$Correlation[1]
+                             ))
+  } else {
+    write_log(paste0("Warning: No correlation data found for pathway pair ", pair1$State1, " and ", pair1$State2))
+  }
+}
+
+# If correlation data found, create bar plot
+if (nrow(top_correlations) > 0) {
+  write_log(paste0("Found correlation data for ", nrow(top_correlations), " specified pathway pairs"))
+  
+  tryCatch({
+    # Use original pathway names directly, no formatting
+    top_correlations$pair_label <- paste(top_correlations$node1, "&", top_correlations$node2)
+    
+    # Save filtered correlation data
+    key_correlations_csv <- file.path(existing_results_path, "Figure4C_Selected_Correlations_Data.csv")
+    write.csv(top_correlations, key_correlations_csv, row.names = FALSE)
+    write_log(paste0("Saved filtered correlation data to: ", key_correlations_csv))
+    
+    # Create factor levels to maintain specified order (reverse order to display from top to bottom)
+    ordered_pairs <- rev(paste(specified_pairs$State1, "&", specified_pairs$State2))
+    top_correlations$pair_label <- factor(top_correlations$pair_label, 
+                                        levels = ordered_pairs,
+                                        ordered = TRUE)
+    
+    # Create bar plot PDF
+    pdf(file.path(existing_results_path, "Figure4C_Selected_Correlations_Barplot.pdf"), 
+        width = 10, height = 6)  # Adjust PDF size
+
+    # Create bar plot
+    p <- ggplot(top_correlations, aes(x = reorder(pair_label, correlation), y = correlation, fill = correlation)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      scale_fill_viridis() +
+      labs(title = "Key Functional State Correlations",
+           x = "Functional State Pairs",
+           y = "Correlation Coefficient") +
+      theme_minimal() +
+      theme(axis.text.y = element_text(size = 10),
+            plot.title = element_text(hjust = 0.5, size = 14),
+            panel.grid.major.y = element_blank())
+    
+    # Print plot
+    print(p)
+    
+    # Close PDF device
+    dev.off()
+    
+    write_log("Saved key correlation bar plot")
+
+  
+  }, error = function(e) {
+    write_log(paste0("Error: Failed to create bar plot - ", conditionMessage(e)))
+  })
+} else {
+  write_log("Warning: No correlation data found for any specified pathway pairs, skipping bar plot creation")
+}
+
+# Assign color groups to nodes
+node_group <- rep("Other", nrow(network_nodes))
+names(node_group) <- network_nodes$State
+
+# Assign color groups based on cluster
+node_group[network_nodes$State %in% cluster1_nodes] <- "Cluster 1: Metabolism"
+node_group[network_nodes$State %in% cluster2_nodes] <- "Cluster 2: Cell Cycle & DNA Repair"
+node_group[network_nodes$State %in% cluster3_nodes] <- "Cluster 3: Signal Transduction"
+node_group[network_nodes$State %in% cluster4_nodes] <- "Cluster 4: Immune Response"
+
+# Function to scale node sizes
+scale_node_sizes <- function(degrees, min_size = 5, max_size = 15) {
+  # If all degrees are the same, return medium size
+  if (length(unique(degrees)) == 1) {
+    return(rep((min_size + max_size)/2, length(degrees)))
+  }
+  
+  # Linear scaling of degrees to specified range
+  scaled_sizes <- (degrees - min(degrees)) / (max(degrees) - min(degrees)) * (max_size - min_size) + min_size
+  return(scaled_sizes)
+}
+
+# Prepare network graph data
+write_log("Preparing network graph data")
+
+# Create igraph object
+g_full <- tryCatch({
+  # Check if edge data is empty
+  if (nrow(network_edges) > 0) {
+    # Ensure edge nodes exist in node list
+    valid_edges <- network_edges[network_edges$State1 %in% network_nodes$State & 
+                                network_edges$State2 %in% network_nodes$State, ]
+    
+    if (nrow(valid_edges) > 0) {
+      write_log(paste0("Creating network with ", nrow(valid_edges), " valid edges"))
+      g <- graph_from_data_frame(d = valid_edges, vertices = network_nodes, directed = FALSE)
+      
+      # Ensure Degree info is preserved
+      if ("Degree" %in% colnames(network_nodes)) {
+        V(g)$Degree <- network_nodes$Degree[match(V(g)$name, network_nodes$State)]
+      }
+      g
+    } else {
+      write_log("Warning: No valid edge data, creating graph with only nodes")
+      g <- graph_from_data_frame(d = data.frame(State1 = character(0), 
+                                              State2 = character(0), 
+                                              stringsAsFactors = FALSE),
+                               vertices = network_nodes,
+                               directed = FALSE)
+      if ("Degree" %in% colnames(network_nodes)) {
+        V(g)$Degree <- network_nodes$Degree[match(V(g)$name, network_nodes$State)]
+      }
+      g
+    }
+  } else {
+    write_log("Warning: No edge data, creating graph with only nodes")
+    g <- graph_from_data_frame(d = data.frame(State1 = character(0), 
+                                           State2 = character(0), 
+                                           stringsAsFactors = FALSE),
+                            vertices = network_nodes,
+                            directed = FALSE)
+    if ("Degree" %in% colnames(network_nodes)) {
+      V(g)$Degree <- network_nodes$Degree[match(V(g)$name, network_nodes$State)]
+    }
+    g
+  }
+}, error = function(e) {
+  write_log(paste0("Error: Creating full igraph object - ", conditionMessage(e)))
+  return(NULL)
+})
+
+# Check if g_full was successfully created
+if (is.null(g_full)) {
+  write_log("Error: Failed to create network graph object, script will exit")
+  stop("Graph creation failed")
+}
+
+# Ensure vertices in graph have name attribute
+if (is.null(V(g_full)$name)) {
+  V(g_full)$name <- as.character(1:vcount(g_full))
+  write_log("Warning: Vertices in graph do not have name attribute, using index as name")
+}
+
+# Create highlighted igraph object
+g_highlight <- tryCatch({
+  if (nrow(key_edges) > 0) {
+    # Get edge list of full graph
+    full_edges <- as_edgelist(g_full)
+    # Create edge identifiers (consider both directions)
+    edge_ids_full <- c(paste(full_edges[,1], full_edges[,2]),
+                      paste(full_edges[,2], full_edges[,1]))
+    key_edge_ids <- c(paste(key_edges$State1, key_edges$State2),
+                     paste(key_edges$State2, key_edges$State1))
+    
+    # Find matching edges
+    matching_edges <- which(edge_ids_full %in% key_edge_ids)
+    matching_edges <- matching_edges[matching_edges <= ecount(g_full)]  # Ensure index does not exceed actual edge count
+    
+    # Extract subgraph from full graph, containing all nodes but only key edges
+    subgraph.edges(g_full, E(g_full)[matching_edges])
+  } else {
+    write_log("Warning: No key edges, creating independent node graph with all key nodes")
+    # Create graph containing only key nodes
+    induced_subgraph(g_full, which(V(g_full)$name %in% all_key_nodes))
+  }
+}, error = function(e) {
+  write_log(paste0("Error: Creating highlighted igraph object - ", conditionMessage(e)))
+  return(NULL)
+})
+
+# Check if g_highlight was successfully created
+if (is.null(g_highlight)) {
+  write_log("Error: Failed to create highlighted network graph object, will use full graph")
+  g_highlight <- g_full
+}
+
+# Set node attributes
+tryCatch({
+  vertex_colors <- ifelse(V(g_highlight)$name %in% cluster1_nodes, "skyblue",
+                  ifelse(V(g_highlight)$name %in% cluster2_nodes, "palegreen",
+                  ifelse(V(g_highlight)$name %in% cluster3_nodes, "plum",
+                  ifelse(V(g_highlight)$name %in% cluster4_nodes, "orange", "lightgray"))))
+  
+  V(g_highlight)$color <- vertex_colors
+  V(g_highlight)$size <- ifelse(V(g_highlight)$name %in% all_key_nodes, 10, 5)
+  V(g_highlight)$frame.color <- "black"
+  V(g_highlight)$label.color <- "black"
+  V(g_highlight)$label.cex <- ifelse(V(g_highlight)$name %in% all_key_nodes, 0.8, 0.6)
+}, error = function(e) {
+  write_log(paste0("Error: Failed to set node attributes - ", conditionMessage(e)))
+  # Set default attributes
+  V(g_highlight)$color <- "lightblue"
+  V(g_highlight)$size <- 5
+  V(g_highlight)$frame.color <- "black"
+  V(g_highlight)$label.color <- "black"
+  V(g_highlight)$label.cex <- 0.7
+})
+
+# Set edge attributes
+if (ecount(g_highlight) > 0) {
+  tryCatch({
+    # Check if edges have weight attribute
+    if ("weight" %in% edge.attributes(g_highlight)) {
+      E(g_highlight)$width <- 2 * abs(E(g_highlight)$weight)
+      E(g_highlight)$color <- ifelse(abs(E(g_highlight)$weight) > 0.9, "red",
+                             ifelse(abs(E(g_highlight)$weight) > 0.8, "orange",
+                             ifelse(abs(E(g_highlight)$weight) > 0.7, "blue", "gray")))
+    } else if ("Correlation" %in% edge.attributes(g_highlight)) {
+      E(g_highlight)$width <- 2 * abs(E(g_highlight)$Correlation)
+      E(g_highlight)$color <- ifelse(abs(E(g_highlight)$Correlation) > 0.9, "red",
+                             ifelse(abs(E(g_highlight)$Correlation) > 0.8, "orange",
+                             ifelse(abs(E(g_highlight)$Correlation) > 0.7, "blue", "gray")))
+    } else {
+      # If no weight attribute, use default values
+      E(g_highlight)$width <- rep(1, ecount(g_highlight))
+      E(g_highlight)$color <- rep("gray", ecount(g_highlight))
+    }
+  }, error = function(e) {
+    write_log(paste0("Error: Failed to set edge attributes - ", conditionMessage(e)))
+    # Set default attributes
+    E(g_highlight)$width <- rep(1, ecount(g_highlight))
+    E(g_highlight)$color <- rep("gray", ecount(g_highlight))
+  })
+}
+
+# Function to plot network graph
+plot_network <- function(g, layout_type, output_base) {
+  write_log(paste0("Plotting network graph: ", layout_type, " layout"))
+  
+  # Check graph object
+  if (is.null(g) || vcount(g) == 0) {
+    write_log("Error: Cannot plot empty graph")
+    return(FALSE)
+  }
+  
+  # Set node size based on degree
+  if ("Degree" %in% vertex_attr_names(g)) {
+    V(g)$size <- scale_node_sizes(vertex_attr(g, "Degree"))
+  } else {
+    V(g)$size <- 10
+    write_log("Warning: No Degree information found, using default node size")
+  }
+  
+  # Set layout
+  layout <- tryCatch({
+    if (layout_type == "fr") {
+      if (ecount(g) > 0) {
+      layout_with_fr(g)
+      } else {
+        # If no edges, use circle layout
+        layout_in_circle(g)
+      }
+    } else if (layout_type == "kk") {
+      if (ecount(g) > 0) {
+      layout_with_kk(g)
+      } else {
+      layout_in_circle(g)
+      }
+    } else {
+      layout_in_circle(g)
+    }
+  }, error = function(e) {
+    write_log(paste0("Warning: Cannot use ", layout_type, " layout, using circle layout instead - ", conditionMessage(e)))
+    layout_in_circle(g)
+  })
+  
+  # Ensure layout dimensions are correct
+  if (nrow(layout) != vcount(g)) {
+    write_log(paste0("Error: Layout dimensions mismatch - need ", vcount(g), " rows, but got ", nrow(layout), " rows"))
+    return(FALSE)
+  }
+  
+  # Set title
+  title <- if (layout_type == "fr") {
+    "Highlighted Functional Association Network (FR Layout)"
+  } else if (layout_type == "kk") {
+    "Highlighted Functional Association Network (KK Layout)"
+  } else {
+    "Highlighted Functional Association Network (Circle Layout)"
+  }
+  
+  # Create PDF file
+  tryCatch({
+    pdf_file <- paste0(output_base, "_", toupper(layout_type), ".pdf")
+    pdf(file.path(existing_results_path, pdf_file), width = 12, height = 10)
+    
+    # Plot network graph
+    plot(g, 
+         layout = layout,
+         vertex.label.family = "sans",
+         vertex.label.dist = 0.5,
+         vertex.label.degree = -pi/2,
+         edge.curved = 0.2,
+         main = title)
+    
+    # Add legend
+           legend("right",       # Legend position: bottom right
+                  legend = c(
+                    "Cluster 1: Metabolism",        # Cluster 1: Metabolism
+                    "Cluster 2: Cell Cycle & DNA Repair",  # Cluster 2: Cell Cycle & DNA Repair
+                    "Cluster 3: Signal Transduction",      # Cluster 3: Signal Transduction
+                    "Cluster 4: Immune Response",          # Cluster 4: Immune Response
+                    "Other"                                # Other nodes
+                  ),
+                  col = c("skyblue", "palegreen", "plum", "orange", "lightgray"),  # Corresponding colors
+                  pch = 19,        # Point shape: solid circle
+                  pt.cex = 2,      # Point size
+                  title = "Node Groups",  # Legend title
+                  cex = 0.8        # Text size
+           )
+    
+    dev.off()
+    
+    write_log(paste0("Saved network graph: ", pdf_file))
+    return(TRUE)
+  }, error = function(e) {
+    write_log(paste0("Error: Failed to save network graph - ", conditionMessage(e)))
+    return(FALSE)
+  })
+}
+
+# Plot network graphs for all layout versions
+plot_network(g_highlight, "fr", "Figure4B_Highlighted_Network")
+plot_network(g_highlight, "kk", "Figure4B_Highlighted_Network")
+plot_network(g_highlight, "circle", "Figure4B_Highlighted_Network")
+
+# Create group subnetwork
+write_log("Creating subnetwork visualization")
+
+create_subnetwork <- function(g, node_list, group_name, color) {
+  tryCatch({
+    # Check graph object and node list
+    if (is.null(g) || vcount(g) == 0 || length(node_list) == 0) {
+      write_log(paste0("Warning: Cannot create subnetwork for ", group_name, " group - graph or node list is empty"))
+      return(FALSE)
+    }
+    
+    # Ensure nodes exist in graph
+    nodes_in_graph <- intersect(node_list, V(g)$name)
+    if (length(nodes_in_graph) < 2) {
+      write_log(paste0("Warning: Not enough nodes in ", group_name, " group to create subnetwork"))
+      return(FALSE)
+    }
+    
+    # Create subgraph
+    subg <- induced_subgraph(g, which(V(g)$name %in% nodes_in_graph))
+    
+    # If subgraph is empty, create graph with only nodes
+    if (vcount(subg) == 0) {
+      write_log(paste0("Warning: ", group_name, " subgraph is empty, creating graph with only nodes"))
+      subg <- make_empty_graph(n = length(nodes_in_graph), directed = FALSE)
+      V(subg)$name <- nodes_in_graph
+    }
+    
+    # Set node attributes
+    V(subg)$color <- color
+    
+    # Set node size based on degree
+    if ("Degree" %in% vertex_attr_names(subg)) {
+      V(subg)$size <- scale_node_sizes(vertex_attr(subg, "Degree"), min_size = 8, max_size = 15)  # Restore original node size range
+      } else {
+      V(subg)$size <- 10
+      write_log("Warning: No Degree information found, using default node size")
+    }
+    
+    # Set layout (use circle layout to ensure stability)
+    layout <- layout_in_circle(subg)
+    
+    # Translate group name to English
+    group_name_eng <- switch(group_name,
+      "Cluster 1: Metabolism" = "Cluster 1: Metabolism",
+      "Cluster 2: Cell Cycle & DNA Repair" = "Cluster 2: Cell Cycle & DNA Repair",
+      "Cluster 3: Signal Transduction" = "Cluster 3: Signal Transduction",
+      "Cluster 4: Immune Response" = "Cluster 4: Immune Response",
+      group_name
+    )
+    
+    # # Create PDF
+    # pdf_file <- paste0("Figure4_Subnetwork_", group_name, ".pdf")
+    #   pdf(file.path(existing_results_path, pdf_file), width = 8, height = 7)
+      
+    #   plot(subg, 
+    #        layout = layout,
+    #        vertex.label.family = "sans",
+    #        vertex.label.dist = 0.5,
+    #        vertex.label.degree = -pi/2,
+    #      main = paste0(group_name_eng, " Functional States Subnetwork"))
+      
+    #   dev.off()
+      
+    write_log(paste0("Created ", group_name, " subnetwork graph"))
+      return(TRUE)
+  }, error = function(e) {
+    write_log(paste0("Error: Failed to create ", group_name, " subnetwork - ", conditionMessage(e)))
+    return(FALSE)
+  })
+}
+
+# Create subnetworks for each group (remove High_Degree network creation)
+create_subnetwork(g_full, cluster1_nodes, "Cluster 1: Metabolism", "skyblue")
+create_subnetwork(g_full, cluster2_nodes, "Cluster 2: Cell Cycle & DNA Repair", "palegreen")
+create_subnetwork(g_full, cluster3_nodes, "Cluster 3: Signal Transduction", "plum")
+create_subnetwork(g_full, cluster4_nodes, "Cluster 4: Immune Response", "orange")
+
+# Add function to create combined network graph
+create_combined_network <- function(g, cluster1_nodes, cluster2_nodes, cluster3_nodes, cluster4_nodes) {
+  write_log("Creating combined network visualization")
+  
+  # Get all cluster nodes
+  all_cluster_nodes <- unique(c(cluster1_nodes, cluster2_nodes, cluster3_nodes, cluster4_nodes))
+  
+  # Create subgraph
+  subg <- induced_subgraph(g, which(V(g)$name %in% all_cluster_nodes))
+  
+  if (vcount(subg) == 0) {
+    write_log("Error: Cannot create combined network graph - no valid nodes")
+    return(FALSE)
+  }
+  
+  # Export node info to CSV
+  nodes_df <- data.frame(
+    Node = V(subg)$name,
+    Cluster = case_when(
+      V(subg)$name %in% cluster1_nodes ~ "Cluster 1: Metabolism",
+      V(subg)$name %in% cluster2_nodes ~ "Cluster 2: Cell Cycle & DNA Repair",
+      V(subg)$name %in% cluster3_nodes ~ "Cluster 3: Signal Transduction",
+      V(subg)$name %in% cluster4_nodes ~ "Cluster 4: Immune Response",
+      TRUE ~ "Other"
+    ),
+    Degree = degree(subg),
+    stringsAsFactors = FALSE
+  )
+  
+  # Export edge info to CSV
+  if (ecount(subg) > 0) {
+    # Get edge list
+    edge_list <- as_edgelist(subg)
+    
+    # Find index of corresponding edges in original data
+    edge_pairs <- paste(edge_list[,1], edge_list[,2])
+    orig_pairs <- paste(network_edges$State1, network_edges$State2)
+    rev_pairs <- paste(network_edges$State2, network_edges$State1)
+    
+    # Initialize weight, correlation and sign vectors
+    edge_weights <- numeric(nrow(edge_list))
+    edge_correlations <- numeric(nrow(edge_list))
+    edge_signs <- character(nrow(edge_list))
+    
+    # Find corresponding weight, correlation and sign for each edge
+    for (i in 1:nrow(edge_list)) {
+      # Check forward and reverse match
+      idx <- which(orig_pairs == edge_pairs[i] | rev_pairs == edge_pairs[i])[1]
+      if (!is.na(idx)) {
+        edge_weights[i] <- network_edges$Abs_Weight[idx]
+        edge_correlations[i] <- network_edges$Correlation[idx]
+        edge_signs[i] <- network_edges$Sign[idx]
+      }
+    }
+    
+    # Create edge dataframe
+    edges_df <- data.frame(
+      Source = edge_list[,1],
+      Target = edge_list[,2],
+      Weight = edge_weights,
+      Correlation = edge_correlations,
+      Sign = edge_signs,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    edges_df <- data.frame(
+      Source = character(0),
+      Target = character(0),
+      Weight = numeric(0),
+      Correlation = numeric(0),
+      Sign = character(0),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  # Save CSV files
+  write.csv(nodes_df, file.path(existing_results_path, "Figure4B_Combined_Network_Nodes.csv"), row.names = FALSE)
+  write.csv(edges_df, file.path(existing_results_path, "Figure4B_Combined_Network_Edges.csv"), row.names = FALSE)
+  
+  write_log("Exported network data to CSV files")
+  write_log(paste0("Number of nodes: ", nrow(nodes_df), ", Number of edges: ", nrow(edges_df)))
+  write_log(paste0("Number of edges with matched weights and correlations: ", sum(!is.na(edges_df$Weight)), "/", nrow(edges_df)))
+  
+  # Set node color
+  V(subg)$color <- "lightgray"  # Default color
+  V(subg)$color[match(cluster1_nodes, V(subg)$name)] <- "skyblue"
+  V(subg)$color[match(cluster2_nodes, V(subg)$name)] <- "palegreen"
+  V(subg)$color[match(cluster3_nodes, V(subg)$name)] <- "plum"
+  V(subg)$color[match(cluster4_nodes, V(subg)$name)] <- "orange"
+  
+  # Set node size based on degree
+  if ("Degree" %in% vertex_attr_names(subg)) {
+    V(subg)$size <- scale_node_sizes(vertex_attr(subg, "Degree"), min_size = 8, max_size = 15)  # Restore original node size range
+  } else {
+    V(subg)$size <- 10
+    write_log("Warning: No Degree information found, using default node size")
+  }
+  
+  # Set edge attributes
+  if (ecount(subg) > 0) {
+    # Set edge width based on weight (reduce line thickness)
+    E(subg)$width <- 0.5 + abs(edges_df$Correlation)  # Reduce base width and coefficient
+    
+    # Set edge color based on positive/negative correlation (Note: capitalized "Positive")
+    E(subg)$color <- ifelse(edges_df$Sign == "Positive", "#FF6B6B", "#4ECDC4")  # Red for positive, teal for negative
+    
+    # Set edge transparency based on correlation strength
+    edge_alpha <- scales::alpha(E(subg)$color, alpha = pmin(0.9, 0.3 + abs(edges_df$Correlation)))
+    E(subg)$color <- edge_alpha
+  }
+  
+  # Try different layouts
+  layouts <- list(
+    fr = tryCatch(layout_with_fr(subg), error = function(e) NULL),
+    kk = tryCatch(layout_with_kk(subg), error = function(e) NULL),
+    circle = layout_in_circle(subg)
+  )
+  
+  for (layout_name in names(layouts)) {
+    if (is.null(layouts[[layout_name]])) next
+    
+    # Create PDF
+    pdf_file <- paste0("Figure4B_Combined_Clusters_", toupper(layout_name), ".pdf")
+    tryCatch({
+      # Reduce image size but keep aspect ratio
+      pdf(file.path(existing_results_path, pdf_file), width = 6, height = 4.5)
+      # Adjust margins to fit smaller image size
+      par(mar = c(2, 2, 2, 5))
+      
+      plot(subg,
+           layout = layouts[[layout_name]],
+           vertex.label.family = "sans",
+           vertex.label.dist = 0.6,  # Increase label distance to fit larger nodes
+           vertex.label.degree = -pi/2,
+           vertex.label.cex = 0.4,   # Reduce text size
+           vertex.label.color = "black",
+           vertex.size = V(subg)$size,  # Use original node size
+           edge.curved = 0.1,
+           main = paste0("Combined Clusters Network (", toupper(layout_name), " Layout)"))
+      
+      # Adjust legend position and size
+      # Node legend
+      legend(x = "topright",
+             inset = c(-0.2, 0.5),
+             legend = c("Cluster 1: Metabolism",
+                       "Cluster 2: Cell Cycle & DNA Repair",
+                       "Cluster 3: Signal Transduction",
+                       "Cluster 4: Immune Response"),
+             col = c("skyblue", "palegreen", "plum", "orange"),
+             pch = 19,
+             pt.cex = 1.2,  # Increase legend point size
+             title = "Clusters",
+             cex = 0.5,     # Reduce legend text size
+             title.cex = 0.6,
+             xpd = TRUE,
+             bty = "n")
+      
+      # Edge legend
+      legend(x = "topright",
+             inset = c(-0.2, 0),
+             legend = c("Strong Positive Correlation (>0.6)",
+                       "Moderate Positive Correlation (0.3-0.6)",
+                       "Strong Negative Correlation (<-0.6)",
+                       "Moderate Negative Correlation (-0.6--0.3)"),
+             col = c("#FF6B6B", scales::alpha("#FF6B6B", 0.5),
+                     "#4ECDC4", scales::alpha("#4ECDC4", 0.5)),
+             lwd = c(1.5, 1, 1.5, 1),
+             title = "Correlations",
+             cex = 0.5,     # Reduce legend text size
+             title.cex = 0.6,
+             xpd = TRUE,
+             bty = "n")
+      
+      dev.off()
+      
+      write_log(paste0("Saved combined network graph: ", pdf_file))
+    }, error = function(e) {
+      write_log(paste0("Error: Failed to save combined network graph for ", layout_name, " layout - ", conditionMessage(e)))
+    })
+  }
+  
+  return(TRUE)
+}
+
+# Create combined network graph, calling function defined above
+create_combined_network(g_full, cluster1_nodes, cluster2_nodes, cluster3_nodes, cluster4_nodes)
+
+# Done
+write_log("Figure 4 highlighted visualization completed")
+write_log(paste0("All result files saved to: ", existing_results_path))
+
+# Close log
+close(log_con)
+
+####################################################################################
+
+#!/usr/bin/env Rscript
+
+# Figure 5: Association between agent activity profiles and key gene mutation statuses
+# Based on plan.md design
+
+# 0. Set up log file
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure5.log")
+log_con <- file(log_file, "w")
+
+# Define log output function
+log_message <- function(message, print_to_console = FALSE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Ensure log file closes on exit
+on.exit({
+  close(log_con)
+  log_message(paste0("\nLog saved to: ", normalizePath(log_file), "\n"), print_to_console = TRUE)
+})
+
+# 0. Load necessary R packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# Check and load necessary packages
+required_packages <- c("ggplot2", "dplyr", "tidyr", "ggpubr", "patchwork")
+
+# Try loading readr package
+readr_loaded <- FALSE
+try({
+  # Try loading directly first
+  suppressPackageStartupMessages(library(readr))
+  readr_loaded <- TRUE
+  log_message("Successfully loaded readr package\n", print_to_console = TRUE)
+}, silent = TRUE)
+
+# If direct loading fails, try using read.csv instead
+if (!readr_loaded) {
+  log_message("Failed to load readr package, using basic read.csv function instead\n", print_to_console = TRUE)
+}
+
+# Load other packages
+for (pkg in required_packages) {
+  # Use suppressWarnings to avoid warning messages
+  if (!suppressWarnings(requireNamespace(pkg, quietly = TRUE))) {
+    log_message(paste0("Installing package: ", pkg, "\n"), print_to_console = TRUE)
+    install.packages(pkg)
+  } else {
+    log_message(paste0("Loading installed package: ", pkg, "\n"))
+  }
+  # Use suppressPackageStartupMessages to avoid loading messages
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}
+
+# Check dplyr version and log it
+dplyr_version <- as.character(packageVersion("dplyr"))
+log_message(paste0("Using dplyr version: ", dplyr_version, "\n"), print_to_console = TRUE)
+
+# 1. Prepare data
+# 1.1 Load previously generated GSVA score data
+log_message("Loading previously generated GSVA score data...\n", print_to_console = TRUE)
+
+# Try different paths to find data files
+results_paths <- c(
+  "results",                      # Relative to current directory
+  "../results",                   # Relative to code directory
+  file.path(getwd(), "results"),  # Absolute path
+  file.path(dirname(getwd()), "results") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_results_path <- NULL
+for (path in results_paths) {
+  if (dir.exists(path) &&
+      file.exists(file.path(path, "gsva_scores.rds")) &&
+      file.exists(file.path(path, "patient_metadata.rds"))) {
+    existing_results_path <- path
+    log_message(paste0("Found data directory: ", existing_results_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_results_path)) {
+  stop("Error: Previously generated data files not found. Please run figure2.R script first.")
+}
+
+# Read data files
+gsva_scores_tcga <- readRDS(file.path(existing_results_path, "gsva_scores.rds"))
+patient_metadata <- readRDS(file.path(existing_results_path, "patient_metadata.rds"))
+
+# 1.2 Load TP53 and CTNNB1 mutation data
+log_message("Loading TP53 and CTNNB1 mutation data...\n", print_to_console = TRUE)
+
+# Try different paths to find mutation data files
+mutation_paths <- c(
+  "data",                         # Relative to current directory
+  "../data",                      # Relative to code directory
+  file.path(getwd(), "data"),     # Absolute path
+  file.path(dirname(getwd()), "data") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_mutation_path <- NULL
+for (path in mutation_paths) {
+  if (dir.exists(path) &&
+      file.exists(file.path(path, "alterations_across_samples_TP53.csv")) &&
+      file.exists(file.path(path, "alterations_across_samples_CTNNB1.csv"))) {
+    existing_mutation_path <- path
+    log_message(paste0("Found mutation data directory: ", existing_mutation_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_mutation_path)) {
+  stop("Error: Mutation data files not found. Please ensure files exist in the 'data' directory.")
+}
+
+# Read mutation data files
+tp53_mutations <- read.csv(file.path(existing_mutation_path, "alterations_across_samples_TP53.csv"))
+ctnnb1_mutations <- read.csv(file.path(existing_mutation_path, "alterations_across_samples_CTNNB1.csv"))
+
+# Print mutation data column names to understand data structure
+log_message(paste0("TP53 mutation data column names: ", paste(colnames(tp53_mutations), collapse = ", "), "\n"))
+log_message(paste0("CTNNB1 mutation data column names: ", paste(colnames(ctnnb1_mutations), collapse = ", "), "\n"))
+
+# 1.3 Process mutation data, create mutation status metadata
+log_message("Processing mutation data, creating mutation status metadata...\n", print_to_console = TRUE)
+
+# Check structure of mutation data
+if (!"Sample.ID" %in% colnames(tp53_mutations) || !"Sample.ID" %in% colnames(ctnnb1_mutations)) {
+  # Try to find sample ID column
+  sample_id_cols_tp53 <- grep("Sample|ID|Patient", colnames(tp53_mutations), ignore.case = TRUE)
+  sample_id_cols_ctnnb1 <- grep("Sample|ID|Patient", colnames(ctnnb1_mutations), ignore.case = TRUE)
+
+  if (length(sample_id_cols_tp53) > 0 && length(sample_id_cols_ctnnb1) > 0) {
+    # Use first found column as sample ID column
+    colnames(tp53_mutations)[sample_id_cols_tp53[1]] <- "Sample.ID"
+    colnames(ctnnb1_mutations)[sample_id_cols_ctnnb1[1]] <- "Sample.ID"
+    log_message("Renamed sample ID column to 'Sample.ID'\n", print_to_console = TRUE)
+  } else {
+    stop("Error: Cannot find sample ID column in mutation data.")
+  }
+}
+
+# Directly find Altered column
+altered_col_tp53 <- which(colnames(tp53_mutations) == "Altered")
+altered_col_ctnnb1 <- which(colnames(ctnnb1_mutations) == "Altered")
+
+if (length(altered_col_tp53) == 0 || length(altered_col_ctnnb1) == 0) {
+  stop("Error: Cannot find Altered column in mutation data.")
+}
+
+log_message(paste0("Using TP53 Altered column: ", colnames(tp53_mutations)[altered_col_tp53], "\n"))
+log_message(paste0("Using CTNNB1 Altered column: ", colnames(ctnnb1_mutations)[altered_col_ctnnb1], "\n"))
+
+# Create mutation status data frame
+mutation_data <- data.frame(
+  PatientID = tp53_mutations$Sample.ID,
+  TP53_Status = ifelse(tp53_mutations[[altered_col_tp53]] == 1, "Mutant", "WT"),
+  stringsAsFactors = FALSE
+)
+
+# Add CTNNB1 mutation status
+ctnnb1_status <- data.frame(
+  PatientID = ctnnb1_mutations$Sample.ID,
+  CTNNB1_Status = ifelse(ctnnb1_mutations[[altered_col_ctnnb1]] == 1, "Mutant", "WT"),
+  stringsAsFactors = FALSE
+)
+
+# Merge TP53 and CTNNB1 mutation status
+mutation_data <- merge(mutation_data, ctnnb1_status, by = "PatientID", all = TRUE)
+
+# Handle missing values
+mutation_data$TP53_Status[is.na(mutation_data$TP53_Status)] <- "Unknown"
+mutation_data$CTNNB1_Status[is.na(mutation_data$CTNNB1_Status)] <- "Unknown"
+
+# Print mutation status statistics
+log_message("TP53 mutation status statistics:\n")
+tp53_table <- table(mutation_data$TP53_Status)
+log_message(paste(capture.output(print(tp53_table)), collapse = "\n"))
+log_message("\n")
+
+log_message("CTNNB1 mutation status statistics:\n")
+ctnnb1_table <- table(mutation_data$CTNNB1_Status)
+log_message(paste(capture.output(print(ctnnb1_table)), collapse = "\n"))
+log_message("\n")
+
+# 1.4 Prepare long format data
+log_message("Preparing long format data...\n", print_to_console = TRUE)
+
+# Function: Prepare data for single cohort in long format
+prepare_long_data_mutation <- function(gsva_scores, mutation_data) {
+  # Convert GSVA matrix to long format
+  gsva_long <- as.data.frame(t(gsva_scores))
+  gsva_long$PatientID <- rownames(gsva_long)
+
+  # Ensure PatientID format consistency (use first 12 characters, i.e., TCGA-XX-XXXX format)
+  gsva_long$PatientID_short <- substr(gsva_long$PatientID, 1, 12)
+  mutation_data$PatientID_short <- substr(mutation_data$PatientID, 1, 12)
+
+  # Try to use pivot_longer to convert to long format
+  gsva_long_tidy <- tryCatch({
+    # Try using new tidyr pivot_longer
+    gsva_long %>%
+      pivot_longer(cols = !c(PatientID, PatientID_short),
+                   names_to = "AgentState",
+                   values_to = "Score")
+  }, error = function(e) {
+    # If new method fails, try using old tidyr gather
+    log_message(paste0("pivot_longer failed, trying gather. Error: ", e$message, "\n"))
+    
+    tryCatch({
+      gsva_long %>%
+        gather(key = "AgentState", value = "Score", 
+               -PatientID, -PatientID_short)
+    }, error = function(e2) {
+      # If gather also fails, use basic R reshape
+      log_message(paste0("gather also failed, using basic R functions. Error: ", e2$message, "\n"))
+      
+      # Use reshape function for conversion
+      cols_to_keep <- c("PatientID", "PatientID_short")
+      cols_to_reshape <- setdiff(colnames(gsva_long), cols_to_keep)
+      
+      # Create matrix of variable names and values
+      melted_data <- data.frame(
+        PatientID = rep(gsva_long$PatientID, length(cols_to_reshape)),
+        PatientID_short = rep(gsva_long$PatientID_short, length(cols_to_reshape)),
+        AgentState = rep(cols_to_reshape, each = nrow(gsva_long)),
+        Score = unlist(lapply(cols_to_reshape, function(col) gsva_long[[col]]))
+      )
+      
+      return(melted_data)
+    })
+  })
+
+  # Merge mutation data
+  merged_data <- tryCatch({
+    merge(gsva_long_tidy,
+          mutation_data,
+          by = "PatientID_short",
+          all.x = TRUE)
+  }, error = function(e) {
+    log_message(paste0("Merging data with merge failed, trying alternative method. Error: ", e$message, "\n"))
+    
+    # Use basic R merge function
+    result <- merge(gsva_long_tidy, mutation_data, 
+                  by.x = "PatientID_short", by.y = "PatientID_short", 
+                  all.x = TRUE)
+    return(result)
+  })
+
+  # Handle missing values
+  merged_data$TP53_Status[is.na(merged_data$TP53_Status)] <- "Unknown"
+  merged_data$CTNNB1_Status[is.na(merged_data$CTNNB1_Status)] <- "Unknown"
+
+  # Only keep samples with clear mutation status
+  merged_data <- tryCatch({
+    # Try using dplyr filter
+    merged_data %>%
+      filter(TP53_Status != "Unknown" & CTNNB1_Status != "Unknown")
+  }, error = function(e) {
+    log_message(paste0("dplyr filter failed, using basic R functions. Error: ", e$message, "\n"))
+    
+    # Use basic R logical indexing
+    merged_data[merged_data$TP53_Status != "Unknown" & 
+                  merged_data$CTNNB1_Status != "Unknown", ]
+  })
+
+  # Ensure mutation status is a factor
+  merged_data$TP53_Status <- factor(merged_data$TP53_Status, levels = c("WT", "Mutant"))
+  merged_data$CTNNB1_Status <- factor(merged_data$CTNNB1_Status, levels = c("WT", "Mutant"))
+
+  return(merged_data)
+}
+
+# Prepare TCGA data
+long_data_tcga_mutation <- prepare_long_data_mutation(gsva_scores_tcga, mutation_data)
+
+# Print long format data dimensions
+log_message(paste0("Long format data dimensions: ", paste(dim(long_data_tcga_mutation), collapse = " x "), "\n"))
+log_message(paste0("Number of samples in long format data: ", length(unique(long_data_tcga_mutation$PatientID)), "\n"))
+
+# 2. Select agent states to plot
+log_message("Selecting agent states to plot...\n", print_to_console = TRUE)
+
+# Read all signatures from signature.csv file
+log_message("Reading all signatures from signature.csv file...\n", print_to_console = TRUE)
+
+# Try different paths to find signature file
+signature_paths <- c(
+  "data/signature.csv",           # Relative to current directory
+  "../data/signature.csv",        # Relative to code directory
+  file.path(getwd(), "data/signature.csv"),  # Absolute path
+  file.path(dirname(getwd()), "data/signature.csv") # Parent directory absolute path
+)
+
+# Find existing file path
+existing_signature_path <- NULL
+for (path in signature_paths) {
+  if (file.exists(path)) {
+    existing_signature_path <- path
+    log_message(paste0("Found signature file: ", existing_signature_path, "\n"), print_to_console = TRUE)
+    break
+  }
+}
+
+# Error if files not found
+if (is.null(existing_signature_path)) {
+  stop("Error: Cannot find signature file 'signature.csv'. Please ensure file exists in 'data' directory.")
+}
+
+# Read signature file
+signature_data <- read.csv(existing_signature_path, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+log_message(paste0("Successfully read ", nrow(signature_data), " gene set signatures\n"), print_to_console = TRUE)
+
+# Use all signatures as states to plot
+all_states <- signature_data$基因集作图名称
+log_message(paste0("Read total ", length(all_states), " signatures\n"), print_to_console = TRUE)
+
+# Select TP53 related states - Use all signatures
+tp53_related_states <- all_states
+
+# Select CTNNB1 related states - Use all signatures
+ctnnb1_related_states <- all_states
+
+# Combine all states to plot
+states_to_plot_mutation <- unique(c(tp53_related_states, ctnnb1_related_states))
+
+# Ensure selected states exist in GSVA score data
+states_to_plot_mutation <- intersect(states_to_plot_mutation, unique(long_data_tcga_mutation$AgentState))
+if (length(states_to_plot_mutation) == 0) {
+  stop("Error: None of the selected agent states exist in GSVA score data. Please check state names.")
+}
+log_message(paste0("Will plot the following agent states: ", paste(states_to_plot_mutation, collapse = ", "), "\n"), print_to_console = TRUE)
+
+# Filter data
+plot_data_mutation <- tryCatch({
+  long_data_tcga_mutation %>%
+    filter(AgentState %in% states_to_plot_mutation) %>%
+    mutate(AgentState = factor(AgentState, levels = states_to_plot_mutation))
+}, error = function(e) {
+  log_message(paste0("dplyr filter/mutate failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+  
+  # Use basic R logical indexing and conversion
+  result <- long_data_tcga_mutation[long_data_tcga_mutation$AgentState %in% states_to_plot_mutation, ]
+  result$AgentState <- factor(result$AgentState, levels = states_to_plot_mutation)
+  return(result)
+})
+
+# 3. Plot TP53 related state figures
+log_message("Plotting TP53 related state figures...\n", print_to_console = TRUE)
+
+# Define TP53 plotting function
+create_tp53_plot <- function(data, state_name) {
+  # Extract data for current state
+  state_data <- data %>% filter(AgentState == state_name)
+
+  # Check if data is empty
+  if (nrow(state_data) == 0) {
+    log_message(paste0("Warning: No data for ", state_name, "\n"), print_to_console = TRUE)
+    # Return a blank plot
+    p <- ggplot() +
+      annotate("text", x = 0, y = 0, label = paste("No data for", state_name)) +
+      theme_minimal()
+    return(p)
+  }
+
+  # Check if there are two mutation groups in data
+  if (length(unique(state_data$TP53_Status)) < 2) {
+    log_message(paste0("Warning: Only one TP53 status group for ", state_name, "\n"), print_to_console = TRUE)
+    # Return a blank plot
+    p <- ggplot() +
+      annotate("text", x = 0, y = 0, label = paste("Only one TP53 status group for", state_name)) +
+      theme_minimal()
+    return(p)
+  }
+
+  # Calculate p-value
+  p_val <- tryCatch({
+    wilcox.test(Score ~ TP53_Status, data = state_data)$p.value
+  }, error = function(e) {
+    log_message(paste0("Warning: Unable to calculate p-value for ", state_name, ": ", e$message, "\n"), print_to_console = TRUE)
+    return(NA)
+  })
+
+  # Create plot
+  p <- ggplot(state_data, aes(x = TP53_Status, y = Score, fill = TP53_Status)) +
+    geom_violin(trim = FALSE, alpha = 0.5, draw_quantiles = c(0.25, 0.5, 0.75)) +
+    scale_fill_manual(values = c("WT" = "lightblue", "Mutant" = "darkorange")) +
+    labs(
+      title = state_name,
+      x = "TP53 Status",
+      y = "Activity Score"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 0, hjust = 0.5),
+          plot.title = element_text(hjust = 0.5, size = 9))
+
+  # Add p-value
+  if (!is.na(p_val)) {
+    p <- p + stat_compare_means(
+      aes(group = TP53_Status),
+      method = "wilcox.test",
+      label = "p.format",
+      size = 3,
+      label.y.npc = 0.9
+    )
+  }
+
+  return(p)
+}
+
+# # Generate TP53 related plots
+# tp53_plot_list <- list()
+# for (state in tp53_related_states) {
+#   log_message(paste0("Plotting TP53 related figure for ", state, "...\n"), print_to_console = TRUE)
+#   tp53_plot_list[[state]] <- create_tp53_plot(plot_data_mutation, state)
+# }
+
+# 4. Plot CTNNB1 related state figures
+log_message("Plotting CTNNB1 related state figures...\n", print_to_console = TRUE)
+
+# Define CTNNB1 plotting function
+create_ctnnb1_plot <- function(data, state_name) {
+  # Extract data for current state
+  state_data <- data %>% filter(AgentState == state_name)
+
+  # Check if data is empty
+  if (nrow(state_data) == 0) {
+    log_message(paste0("Warning: No data for ", state_name, "\n"), print_to_console = TRUE)
+    # Return a blank plot
+    p <- ggplot() +
+      annotate("text", x = 0, y = 0, label = paste("No data for", state_name)) +
+      theme_minimal()
+    return(p)
+  }
+
+  # Check if there are two mutation groups in data
+  if (length(unique(state_data$CTNNB1_Status)) < 2) {
+    log_message(paste0("Warning: Only one CTNNB1 status group for ", state_name, "\n"), print_to_console = TRUE)
+    # Return a blank plot
+    p <- ggplot() +
+      annotate("text", x = 0, y = 0, label = paste("Only one CTNNB1 status group for", state_name)) +
+      theme_minimal()
+    return(p)
+  }
+
+  # Calculate p-value
+  p_val <- tryCatch({
+    wilcox.test(Score ~ CTNNB1_Status, data = state_data)$p.value
+  }, error = function(e) {
+    log_message(paste0("Warning: Unable to calculate p-value for ", state_name, ": ", e$message, "\n"), print_to_console = TRUE)
+    return(NA)
+  })
+
+  # Create plot
+  p <- ggplot(state_data, aes(x = CTNNB1_Status, y = Score, fill = CTNNB1_Status)) +
+    geom_violin(trim = FALSE, alpha = 0.5, draw_quantiles = c(0.25, 0.5, 0.75)) +
+    scale_fill_manual(values = c("WT" = "lightgreen", "Mutant" = "purple")) +
+    labs(
+      title = state_name,
+      x = "CTNNB1 Status",
+      y = "Activity Score"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 0, hjust = 0.5),
+          plot.title = element_text(hjust = 0.5, size = 9))
+
+  # Add p-value
+  if (!is.na(p_val)) {
+    p <- p + stat_compare_means(
+      aes(group = CTNNB1_Status),
+      method = "wilcox.test",
+      label = "p.format",
+      size = 3,
+      label.y.npc = 0.9
+    )
+  }
+
+  return(p)
+}
+
+# # Generate CTNNB1 related plots
+# ctnnb1_plot_list <- list()
+# for (state in ctnnb1_related_states) {
+#   log_message(paste0("Plotting CTNNB1 related figure for ", state, "...\n"), print_to_console = TRUE)
+#   ctnnb1_plot_list[[state]] <- create_ctnnb1_plot(plot_data_mutation, state)
+# }
+
+# # 5. Combine figures
+# log_message("Combining figures...\n", print_to_console = TRUE)
+
+# # Save figures individually, do not attempt to combine
+# log_message("Skipping figure combination, generating individual figures directly...\n", print_to_console = TRUE)
+
+# 6. Save data and plots
+log_message("Saving data and plots...\n", print_to_console = TRUE)
+
+# Create output directory
+output_dir <- existing_results_path
+
+# Save TP53 mutation status difference data
+log_message("Saving TP53 mutation status difference data...\n", print_to_console = TRUE)
+
+# Extract mean value of each state in different TP53 mutation statuses from long format data
+# Compatible with different versions of dplyr
+tp53_means <- tryCatch({
+  # Try using new dplyr syntax
+  plot_data_mutation %>%
+    group_by(AgentState, TP53_Status) %>%
+    summarise(Mean_Score = mean(Score, na.rm = TRUE),
+              SD_Score = sd(Score, na.rm = TRUE),
+              N = n(), 
+              .groups = "drop")
+}, error = function(e) {
+  # If failed, try using old dplyr syntax
+  log_message(paste0("First summarise method failed, trying alternative method. Error: ", e$message, "\n"), print_to_console = TRUE)
+  tryCatch({
+    plot_data_mutation %>%
+      group_by(AgentState, TP53_Status) %>%
+      summarise(Mean_Score = mean(Score, na.rm = TRUE),
+                SD_Score = sd(Score, na.rm = TRUE),
+                N = n()) %>%
+      ungroup()
+  }, error = function(e2) {
+    # If still failed, use basic R functions
+    log_message(paste0("Second summarise method also failed, using basic R functions. Error: ", e2$message, "\n"), print_to_console = TRUE)
+    result <- aggregate(Score ~ AgentState + TP53_Status, data = plot_data_mutation, 
+                      FUN = function(x) c(Mean_Score = mean(x, na.rm = TRUE), 
+                                        SD_Score = sd(x, na.rm = TRUE), 
+                                        N = length(x)))
+    # Convert result to data frame
+    result_df <- do.call(data.frame, result)
+    return(result_df)
+  })
+})
+
+# Calculate p-values
+tp53_pvals <- data.frame(
+  AgentState = character(),
+  P_Value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (state in unique(plot_data_mutation$AgentState)) {
+  state_data <- plot_data_mutation[plot_data_mutation$AgentState == state, ]
+  if (length(unique(state_data$TP53_Status)) >= 2) {
+    p_val <- tryCatch({
+      wilcox.test(Score ~ TP53_Status, data = state_data)$p.value
+    }, error = function(e) {
+      NA
+    })
+    tp53_pvals <- rbind(tp53_pvals, data.frame(AgentState = state, P_Value = p_val))
+  }
+}
+
+# Convert mean data to wide format
+tp53_means_wide <- tryCatch({
+  tp53_means %>%
+    pivot_wider(id_cols = AgentState,
+                names_from = TP53_Status,
+                values_from = c(Mean_Score, SD_Score, N))
+}, error = function(e) {
+  log_message(paste0("pivot_wider failed, trying alternative method. Error: ", e$message, "\n"), print_to_console = TRUE)
+  
+  # Use tidyr::spread as alternative method (for old version tidyr)
+  tryCatch({
+    # First create separate datasets for each statistic, then merge
+    mean_data <- tp53_means %>%
+      select(AgentState, TP53_Status, Mean_Score) %>%
+      spread(key = TP53_Status, value = Mean_Score, sep = "_")
+    
+    sd_data <- tp53_means %>%
+      select(AgentState, TP53_Status, SD_Score) %>%
+      spread(key = TP53_Status, value = SD_Score, sep = "_")
+    
+    n_data <- tp53_means %>%
+      select(AgentState, TP53_Status, N) %>%
+      spread(key = TP53_Status, value = N, sep = "_")
+    
+    # Merge data
+    result <- left_join(mean_data, sd_data, by = "AgentState")
+    result <- left_join(result, n_data, by = "AgentState")
+    
+    return(result)
+  }, error = function(e2) {
+    log_message(paste0("spread also failed, using basic R functions. Error: ", e2$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R function reshape as last resort
+    tp53_long <- tp53_means
+    result <- reshape(tp53_long, 
+                    idvar = "AgentState",
+                    timevar = "TP53_Status", 
+                    direction = "wide")
+    
+    # Rename columns to match expected output format
+    colnames(result) <- gsub("Mean_Score\\.", "Mean_Score_", colnames(result))
+    colnames(result) <- gsub("SD_Score\\.", "SD_Score_", colnames(result))
+    colnames(result) <- gsub("N\\.", "N_", colnames(result))
+    
+    return(result)
+  })
+})
+
+# Merge means and p-values
+tp53_results <- left_join(tp53_means_wide, tp53_pvals, by = "AgentState")
+
+# Save TP53 results
+tp53_csv <- file.path(output_dir, "Figure5_TP53_Mutation_Comparison.csv")
+write.csv(tp53_results, tp53_csv, row.names = FALSE)
+log_message(paste0("Saved TP53 mutation status difference data table: ", tp53_csv, "\n"), print_to_console = TRUE)
+
+# Save CTNNB1 mutation status difference data
+log_message("Saving CTNNB1 mutation status difference data...\n", print_to_console = TRUE)
+
+# Extract mean value of each state in different CTNNB1 mutation statuses from long format data
+# Compatible with different versions of dplyr
+ctnnb1_means <- tryCatch({
+  # Try using new dplyr syntax
+  plot_data_mutation %>%
+    group_by(AgentState, CTNNB1_Status) %>%
+    summarise(Mean_Score = mean(Score, na.rm = TRUE),
+              SD_Score = sd(Score, na.rm = TRUE),
+              N = n(), 
+              .groups = "drop")
+}, error = function(e) {
+  # If failed, try using old dplyr syntax
+  log_message(paste0("First summarise method failed, trying alternative method. Error: ", e$message, "\n"), print_to_console = TRUE)
+  tryCatch({
+    plot_data_mutation %>%
+      group_by(AgentState, CTNNB1_Status) %>%
+      summarise(Mean_Score = mean(Score, na.rm = TRUE),
+                SD_Score = sd(Score, na.rm = TRUE),
+                N = n()) %>%
+      ungroup()
+  }, error = function(e2) {
+    # If still failed, use basic R functions
+    log_message(paste0("Second summarise method also failed, using basic R functions. Error: ", e2$message, "\n"), print_to_console = TRUE)
+    result <- aggregate(Score ~ AgentState + CTNNB1_Status, data = plot_data_mutation, 
+                      FUN = function(x) c(Mean_Score = mean(x, na.rm = TRUE), 
+                                        SD_Score = sd(x, na.rm = TRUE), 
+                                        N = length(x)))
+    # Convert result to data frame
+    result_df <- do.call(data.frame, result)
+    return(result_df)
+  })
+})
+
+# Calculate p-values
+ctnnb1_pvals <- data.frame(
+  AgentState = character(),
+  P_Value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (state in unique(plot_data_mutation$AgentState)) {
+  state_data <- plot_data_mutation[plot_data_mutation$AgentState == state, ]
+  if (length(unique(state_data$CTNNB1_Status)) >= 2) {
+    p_val <- tryCatch({
+      wilcox.test(Score ~ CTNNB1_Status, data = state_data)$p.value
+    }, error = function(e) {
+      NA
+    })
+    ctnnb1_pvals <- rbind(ctnnb1_pvals, data.frame(AgentState = state, P_Value = p_val))
+  }
+}
+
+# Convert mean data to wide format
+ctnnb1_means_wide <- tryCatch({
+  ctnnb1_means %>%
+    pivot_wider(id_cols = AgentState,
+                names_from = CTNNB1_Status,
+                values_from = c(Mean_Score, SD_Score, N))
+}, error = function(e) {
+  log_message(paste0("pivot_wider failed, trying alternative method. Error: ", e$message, "\n"), print_to_console = TRUE)
+  
+  # Use tidyr::spread as alternative method (for old version tidyr)
+  tryCatch({
+    # First create separate datasets for each statistic, then merge
+    mean_data <- ctnnb1_means %>%
+      select(AgentState, CTNNB1_Status, Mean_Score) %>%
+      spread(key = CTNNB1_Status, value = Mean_Score, sep = "_")
+    
+    sd_data <- ctnnb1_means %>%
+      select(AgentState, CTNNB1_Status, SD_Score) %>%
+      spread(key = CTNNB1_Status, value = SD_Score, sep = "_")
+    
+    n_data <- ctnnb1_means %>%
+      select(AgentState, CTNNB1_Status, N) %>%
+      spread(key = CTNNB1_Status, value = N, sep = "_")
+    
+    # Merge data
+    result <- left_join(mean_data, sd_data, by = "AgentState")
+    result <- left_join(result, n_data, by = "AgentState")
+    
+    return(result)
+  }, error = function(e2) {
+    log_message(paste0("spread also failed, using basic R functions. Error: ", e2$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R function reshape as last resort
+    ctnnb1_long <- ctnnb1_means
+    result <- reshape(ctnnb1_long, 
+                    idvar = "AgentState",
+                    timevar = "CTNNB1_Status", 
+                    direction = "wide")
+    
+    # Rename columns to match expected output format
+    colnames(result) <- gsub("Mean_Score\\.", "Mean_Score_", colnames(result))
+    colnames(result) <- gsub("SD_Score\\.", "SD_Score_", colnames(result))
+    colnames(result) <- gsub("N\\.", "N_", colnames(result))
+    
+    return(result)
+  })
+})
+
+# Merge means and p-values
+ctnnb1_results <- left_join(ctnnb1_means_wide, ctnnb1_pvals, by = "AgentState")
+
+# Save CTNNB1 results
+ctnnb1_csv <- file.path(output_dir, "Figure5_CTNNB1_Mutation_Comparison.csv")
+write.csv(ctnnb1_results, ctnnb1_csv, row.names = FALSE)
+log_message(paste0("Saved CTNNB1 mutation status difference data table: ", ctnnb1_csv, "\n"), print_to_console = TRUE)
+
+# # Skip saving combined figures
+# log_message("Skipping saving combined figures...\n", print_to_console = TRUE)
+
+# # 7. Save individual figures for each state
+# log_message("Saving individual figures for each state...\n", print_to_console = TRUE)
+
+# # Save TP53 related state figures
+# for (state in names(tp53_plot_list)) {
+#   state_output_pdf <- file.path(output_dir, paste0("Figure5_TP53_", state, ".pdf"))
+#   state_output_png <- file.path(output_dir, paste0("Figure5_TP53_", state, ".png"))
+
+#   ggsave(state_output_pdf, tp53_plot_list[[state]], width = 6, height = 4)
+#   ggsave(state_output_png, tp53_plot_list[[state]], width = 6, height = 4, dpi = 300);
+
+#   log_message(paste0("Saved TP53 related figure: ", state_output_pdf, "\n"), print_to_console = TRUE)
+# }
+
+# # Save CTNNB1 related state figures
+# for (state in names(ctnnb1_plot_list)) {
+#   state_output_pdf <- file.path(output_dir, paste0("Figure5_CTNNB1_", state, ".pdf"))
+#   state_output_png <- file.path(output_dir, paste0("Figure5_CTNNB1_", state, ".png"))
+
+#   ggsave(state_output_pdf, ctnnb1_plot_list[[state]], width = 6, height = 4)
+#   ggsave(state_output_png, ctnnb1_plot_list[[state]], width = 6, height = 4, dpi = 300)
+
+#   log_message(paste0("Saved CTNNB1 related figure: ", state_output_pdf, "\n"), print_to_console = TRUE)
+# }
+
+# log_message(paste0("Figure 5 complete! Results saved in ", output_dir, " directory\n"), print_to_console = TRUE)
+
+# 8. Output Type_II_IFN_Reponse pathway results individually
+log_message("Outputting Type_II_IFN_Reponse pathway results individually...\n", print_to_console = TRUE)
+
+# Check if Type_II_IFN_Reponse exists in data
+if (!"Type_II_IFN_Reponse" %in% unique(plot_data_mutation$AgentState)) {
+  log_message("Warning: Type_II_IFN_Reponse pathway data not found\n", print_to_console = TRUE)
+} else {
+  # Create TP53 plot for Type_II_IFN_Reponse
+  ifn_tp53_plot <- create_tp53_plot(plot_data_mutation, "Type_II_IFN_Reponse")
+  
+  # Create CTNNB1 plot for Type_II_IFN_Reponse
+  ifn_ctnnb1_plot <- create_ctnnb1_plot(plot_data_mutation, "Type_II_IFN_Reponse")
+  
+  # Save figures for Type_II_IFN_Reponse
+  ifn_tp53_pdf <- file.path(output_dir, "Figure5E_TP53_Type_II_IFN_Reponse.pdf")
+  ifn_ctnnb1_pdf <- file.path(output_dir, "Figure5E_CTNNB1_Type_II_IFN_Reponse.pdf")
+  
+  # Save figures with larger dimensions and higher resolution
+  ggsave(ifn_tp53_pdf, ifn_tp53_plot, width = 4, height = 3, dpi = 300)
+  ggsave(ifn_ctnnb1_pdf, ifn_ctnnb1_plot, width = 4, height = 3, dpi = 300)
+  
+  log_message(paste0("Saved Type_II_IFN_Reponse TP53 related figure: ", ifn_tp53_pdf, "\n"), print_to_console = TRUE)
+  log_message(paste0("Saved Type_II_IFN_Reponse CTNNB1 related figure: ", ifn_ctnnb1_pdf, "\n"), print_to_console = TRUE)
+}
+
+log_message("Type_II_IFN_Reponse pathway analysis complete!\n", print_to_console = TRUE)
+
+########################################################################################
+
+#!/usr/bin/env Rscript
+
+# Figure 5 Visualize Key Findings
+# Based on the results of figure5.R, select important findings for visualization
+
+# Set character encoding and locale
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+# Set up environment
+log_dir <- "log"
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_file <- file.path(log_dir, "figure5_visualize_key_findings.log")
+log_con <- file(log_file, "w")
+
+# Define log output function
+log_message <- function(message, print_to_console = TRUE) {
+  cat(message, file = log_con, append = TRUE)
+  if (print_to_console) {
+    cat(message)
+  }
+}
+
+# Ensure log file closes on exit
+on.exit({
+  close(log_con)
+  log_message(paste0("\nLog saved to: ", normalizePath(log_file), "\n"), print_to_console = TRUE)
+})
+
+# Load necessary R packages
+load_packages <- function() {
+  log_message("Loading necessary R packages...\n", print_to_console = TRUE)
+  
+  required_packages <- c("ggplot2", "dplyr", "tidyr", "ggpubr", "ComplexHeatmap", 
+                         "circlize", "RColorBrewer", "patchwork", "viridis", "ggrepel")
+  
+  for (pkg in required_packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      log_message(paste0("Installing package: ", pkg, "\n"), print_to_console = TRUE)
+      install.packages(pkg)
+    }
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  }
+  
+  # Check and log dplyr version
+  dplyr_version <- as.character(packageVersion("dplyr"))
+  log_message(paste0("Using dplyr version: ", dplyr_version, "\n"), print_to_console = TRUE)
+  
+  # Check and log tidyr version
+  tidyr_version <- as.character(packageVersion("tidyr"))
+  log_message(paste0("Using tidyr version: ", tidyr_version, "\n"), print_to_console = TRUE)
+  
+  log_message("All necessary R packages loaded\n", print_to_console = TRUE)
+}
+
+# Define theme function directly
+theme_publication <- function(base_size = 18, base_family = "sans") {
+  theme_bw(base_size = base_size, base_family = base_family) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, size = 0.5),
+      axis.text = element_text(colour = "black", size = base_size * 0.8),
+      axis.title = element_text(size = base_size),
+      legend.title = element_text(size = base_size * 0.8),
+      legend.text = element_text(size = base_size * 0.7),
+      legend.position = "right",
+      legend.key.size = unit(0.8, "lines"),
+      plot.title = element_text(size = base_size * 1.2, hjust = 0.5),
+      plot.subtitle = element_text(size = base_size * 0.8, hjust = 0.5),
+      plot.caption = element_text(size = base_size * 0.6, hjust = 1)
+    )
+}
+
+# Read CSV files
+read_data <- function() {
+  log_message("Reading CSV result files...\n", print_to_console = TRUE)
+  
+  # Try different paths to find data files
+  results_paths <- c(
+    "results",                      # Relative to current directory
+    "./results",                    # Relative to code directory
+    "../results",                   # Relative to parent directory
+    file.path(getwd(), "results"),  # Absolute path
+    file.path(dirname(getwd()), "results") # Parent directory absolute path
+  )
+  
+  # Find existing file path
+  existing_results_path <- NULL
+  for (path in results_paths) {
+    if (dir.exists(path) &&
+        file.exists(file.path(path, "Figure5_TP53_Mutation_Comparison.csv")) &&
+        file.exists(file.path(path, "Figure5_CTNNB1_Mutation_Comparison.csv"))) {
+      existing_results_path <- path
+      log_message(paste0("Found data directory: ", existing_results_path, "\n"), print_to_console = TRUE)
+      break
+    }
+  }
+  
+  # Error if files not found
+  if (is.null(existing_results_path)) {
+    stop("Error: Previously generated data files not found. Please run figure5.R script first.")
+  }
+  
+  # Ensure output directory exists
+  if (!dir.exists(existing_results_path)) {
+    dir.create(existing_results_path, recursive = TRUE)
+    log_message(paste0("Created output directory: ", existing_results_path, "\n"), print_to_console = TRUE)
+  }
+  
+  # Read TP53 and CTNNB1 mutation comparison data
+  tp53_data <- read.csv(file.path(existing_results_path, "Figure5_TP53_Mutation_Comparison.csv"))
+  ctnnb1_data <- read.csv(file.path(existing_results_path, "Figure5_CTNNB1_Mutation_Comparison.csv"))
+  
+  log_message(paste0("Successfully read TP53 data, total ", nrow(tp53_data), " rows\n"), print_to_console = TRUE)
+  log_message(paste0("Successfully read CTNNB1 data, total ", nrow(ctnnb1_data), " rows\n"), print_to_console = TRUE)
+  
+  return(list(tp53_data = tp53_data, ctnnb1_data = ctnnb1_data, output_dir = existing_results_path))
+}
+
+# Filter significant results - Add error handling
+filter_significant_results <- function(data, p_value_threshold = 0.05, log2fc_threshold = 0.005) {
+  log_message(paste0("Filtering significant results with P-value < ", p_value_threshold, " and absolute Log2FC > ", log2fc_threshold, "...\n"), 
+              print_to_console = TRUE)
+  
+  # Calculate relative change - direct difference for GSVA scores
+  data$Change <- data$Mean_Score_Mutant - data$Mean_Score_WT
+  data$Log2FC <- data$Change  # Use difference directly as Log2FC for GSVA scores
+  
+  # Filter significant states - Use tryCatch to handle potential errors
+  significant_data <- tryCatch({
+    # Try using dplyr filter
+    data %>%
+      filter(!is.na(P_Value) & P_Value < p_value_threshold & abs(Change) > log2fc_threshold) %>%
+      arrange(P_Value)
+  }, error = function(e) {
+    log_message(paste0("dplyr filter/arrange failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R logical indexing and sorting
+    filtered_data <- data[!is.na(data$P_Value) & 
+                          data$P_Value < p_value_threshold & 
+                          abs(data$Change) > log2fc_threshold, ]
+    filtered_data <- filtered_data[order(filtered_data$P_Value), ]
+    return(filtered_data)
+  })
+  
+  log_message(paste0("Filtered ", nrow(significant_data), " significantly different states\n"), print_to_console = TRUE)
+  
+  return(significant_data)
+}
+
+# Plot volcano plot - Add error handling
+plot_volcano <- function(data, gene_name, output_dir) {
+  log_message(paste0("Plotting volcano plot for ", gene_name, " mutation...\n"), print_to_console = TRUE)
+  
+  # Calculate difference and -log10(P-value) - Use tryCatch to handle potential errors
+  plot_data <- tryCatch({
+    # Try using dplyr mutate/case_when
+    data %>%
+      mutate(
+        Change = Mean_Score_Mutant - Mean_Score_WT,
+        neg_log10_p = -log10(P_Value),
+        Significance = case_when(
+          is.na(P_Value) ~ "NS",
+          P_Value < 0.05 & Change > 0.01 ~ "Up",
+          P_Value < 0.05 & Change < -0.01 ~ "Down",
+          TRUE ~ "NS"
+        )
+      )
+  }, error = function(e) {
+    log_message(paste0("dplyr mutate/case_when failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R functions
+    result <- data
+    result$Change <- result$Mean_Score_Mutant - result$Mean_Score_WT
+    result$neg_log10_p <- -log10(result$P_Value)
+    
+    # Create Significance column
+    result$Significance <- "NS"
+    result$Significance[!is.na(result$P_Value) & result$P_Value < 0.05 & result$Change > 0.01] <- "Up"
+    result$Significance[!is.na(result$P_Value) & result$P_Value < 0.05 & result$Change < -0.01] <- "Down"
+    
+    return(result)
+  })
+  
+  # Select top 5 up- and down-regulated results
+  top_up <- plot_data %>%
+    filter(Significance == "Up") %>%
+    arrange(P_Value) %>%
+    head(5)
+  
+  top_down <- plot_data %>%
+    filter(Significance == "Down") %>%
+    arrange(P_Value) %>%
+    head(5)
+  
+  # Combine top results and add labels
+  top_results <- bind_rows(top_up, top_down)
+  plot_data$Label <- ifelse(plot_data$AgentState %in% top_results$AgentState, 
+                           as.character(plot_data$AgentState), 
+                           "")
+  
+  # Adjust volcano plot colors, reference scatter plot
+  volcano_colors <- c(
+    "Up" = "#D55E00",  # Orange (from scatter plot Both Up)
+    "Down" = "#0072B2", # Blue (from scatter plot Both Down)
+    "NS" = "grey80"    # Grey
+  )
+  
+  # Plot volcano plot
+  p <- ggplot(plot_data, aes(x = Change, y = neg_log10_p, color = Significance)) +
+    geom_point(alpha = 0.7, size = 3) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50") +
+    geom_vline(xintercept = c(-0.01, 0.01), linetype = "dashed", color = "grey50") +
+    scale_color_manual(values = volcano_colors) + # Apply adjusted colors
+    ggrepel::geom_text_repel(
+      data = plot_data %>% filter(Label != ""),
+      aes(label = Label),
+      size = 5,
+      max.overlaps = 10,
+      box.padding = 0.5,
+      segment.alpha = 0.5,
+      min.segment.length = 0,
+      force = 10
+    ) +
+    labs(
+      title = paste0(gene_name, " Mutation-Related Agent State Changes"),
+      subtitle = "Top 5 up- and down-regulated states labeled",
+      x = "Activity Score Change (Mutant - Wild Type)",
+      y = "-Log10(P-value)",
+      color = "Change Direction"
+    ) +
+    theme_publication() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 12)
+    )
+  
+  # Save volcano plot data
+  volcano_csv <- file.path(output_dir, paste0("Figure5AB_", gene_name, "_Volcano_Data.csv"))
+  write.csv(plot_data, volcano_csv, row.names = FALSE)
+  log_message(paste0("Saved volcano plot data: ", volcano_csv, "\n"), print_to_console = TRUE)
+  
+  # Save top 5 results data
+  top_results_csv <- file.path(output_dir, paste0("Figure5_", gene_name, "_Volcano_Top5_Results.csv"))
+  write.csv(top_results, top_results_csv, row.names = FALSE)
+  log_message(paste0("Saved Top 5 up- and down-regulated results: ", top_results_csv, "\n"), print_to_console = TRUE)
+  
+  return(p)
+}
+
+# Plot heatmap showing P-value and expression changes - Add error handling and font size parameters
+plot_heatmap <- function(tp53_significant, ctnnb1_significant, output_dir, top_n = 100, 
+                         row_fontsize = 10, col_fontsize = 12, 
+                         legend_title_fontsize = 10, legend_labels_fontsize = 8, 
+                         star_fontsize = 10) {
+  log_message(paste0("Plotting heatmap showing top ", top_n, " agent states related to TP53 and CTNNB1 mutations..."), print_to_console = TRUE)
+  
+  # Check input data
+  log_message(paste0("TP53 data rows: ", nrow(tp53_significant), "\n"), print_to_console = TRUE)
+  log_message(paste0("CTNNB1 data rows: ", nrow(ctnnb1_significant), "\n"), print_to_console = TRUE)
+  
+  # Ensure data contains necessary columns
+  required_columns <- c("AgentState", "Mean_Score_Mutant", "Mean_Score_WT", "P_Value")
+  for (col in required_columns) {
+    if (!(col %in% colnames(tp53_significant)) || !(col %in% colnames(ctnnb1_significant))) {
+      error_msg <- paste0("Error: Data missing required column '", col, "'")
+      log_message(error_msg, print_to_console = TRUE)
+      stop(error_msg)
+    }
+  }
+  
+  # Calculate Change column (if not exists)
+  if (!("Change" %in% colnames(tp53_significant))) {
+    tp53_significant$Change <- tp53_significant$Mean_Score_Mutant - tp53_significant$Mean_Score_WT
+    log_message("Added Change column to TP53 data\n", print_to_console = TRUE)
+  }
+  if (!("Change" %in% colnames(ctnnb1_significant))) {
+    ctnnb1_significant$Change <- ctnnb1_significant$Mean_Score_Mutant - ctnnb1_significant$Mean_Score_WT
+    log_message("Added Change column to CTNNB1 data\n", print_to_console = TRUE)
+  }
+  
+  # Select top N most significant states for each mutation type - Use tryCatch to handle errors
+  top_tp53 <- tryCatch({
+    # If data rows less than top_n, use all data
+    actual_top_n <- min(top_n, nrow(tp53_significant))
+    log_message(paste0("Actual TP53 top_n used: ", actual_top_n, "\n"), print_to_console = TRUE)
+    
+    # Try using dplyr arrange/head
+    tp53_significant %>% 
+      arrange(P_Value) %>% 
+      head(actual_top_n)
+  }, error = function(e) {
+    log_message(paste0("dplyr arrange/head failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R functions
+    ordered_indices <- order(tp53_significant$P_Value)
+    actual_top_n <- min(top_n, length(ordered_indices))
+    tp53_significant[ordered_indices[1:actual_top_n], ]
+  })
+  
+  top_ctnnb1 <- tryCatch({
+    # If data rows less than top_n, use all data
+    actual_top_n <- min(top_n, nrow(ctnnb1_significant))
+    log_message(paste0("Actual CTNNB1 top_n used: ", actual_top_n, "\n"), print_to_console = TRUE)
+    
+    # Try using dplyr arrange/head
+    ctnnb1_significant %>% 
+      arrange(P_Value) %>% 
+      head(actual_top_n)
+  }, error = function(e) {
+    log_message(paste0("dplyr arrange/head failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R functions
+    ordered_indices <- order(ctnnb1_significant$P_Value)
+    actual_top_n <- min(top_n, length(ordered_indices))
+    ctnnb1_significant[ordered_indices[1:actual_top_n], ]
+  })
+  
+  # Combine top states from both mutations
+  all_states <- unique(c(top_tp53$AgentState, top_ctnnb1$AgentState))
+  log_message(paste0("Number of combined states: ", length(all_states), "\n"), print_to_console = TRUE)
+  log_message("State list:\n", print_to_console = TRUE)
+  for (state in all_states) {
+    log_message(paste0(" - ", state, "\n"), print_to_console = TRUE)
+  }
+  
+  # Create heatmap data
+  heatmap_data <- data.frame(
+    AgentState = all_states,
+    stringsAsFactors = FALSE
+  )
+  
+  # Add TP53 and CTNNB1 Change data
+  for (state in all_states) {
+    # TP53 data - Use tryCatch to handle errors
+    tp53_row <- tryCatch({
+      # Try using dplyr filter
+      filtered_data <- tp53_significant %>% filter(AgentState == state)
+      log_message(paste0("Processing TP53 state '", state, "', found ", nrow(filtered_data), " rows\n"), print_to_console = TRUE)
+      filtered_data
+    }, error = function(e) {
+      # Use basic R logical indexing
+      filtered_data <- tp53_significant[tp53_significant$AgentState == state, ]
+      log_message(paste0("Processing TP53 state '", state, "', found ", nrow(filtered_data), " rows\n"), print_to_console = TRUE)
+      filtered_data
+    })
+    
+    if (nrow(tp53_row) > 0) {
+      heatmap_data[heatmap_data$AgentState == state, "TP53_Change"] <- tp53_row$Change[1]
+      heatmap_data[heatmap_data$AgentState == state, "TP53_P_Value"] <- tp53_row$P_Value[1]
+    } else {
+      heatmap_data[heatmap_data$AgentState == state, "TP53_Change"] <- 0
+      heatmap_data[heatmap_data$AgentState == state, "TP53_P_Value"] <- 1
+      log_message(paste0("Warning: TP53 state '", state, "' not found, using default values\n"), print_to_console = TRUE)
+    }
+    
+    # CTNNB1 data - Use tryCatch to handle errors
+    ctnnb1_row <- tryCatch({
+      # Try using dplyr filter
+      filtered_data <- ctnnb1_significant %>% filter(AgentState == state)
+      log_message(paste0("Processing CTNNB1 state '", state, "', found ", nrow(filtered_data), " rows\n"), print_to_console = TRUE)
+      filtered_data
+    }, error = function(e) {
+      # Use basic R logical indexing
+      filtered_data <- ctnnb1_significant[ctnnb1_significant$AgentState == state, ]
+      log_message(paste0("Processing CTNNB1 state '", state, "', found ", nrow(filtered_data), " rows\n"), print_to_console = TRUE)
+      filtered_data
+    })
+    
+    if (nrow(ctnnb1_row) > 0) {
+      heatmap_data[heatmap_data$AgentState == state, "CTNNB1_Change"] <- ctnnb1_row$Change[1]
+      heatmap_data[heatmap_data$AgentState == state, "CTNNB1_P_Value"] <- ctnnb1_row$P_Value[1]
+    } else {
+      heatmap_data[heatmap_data$AgentState == state, "CTNNB1_Change"] <- 0
+      heatmap_data[heatmap_data$AgentState == state, "CTNNB1_P_Value"] <- 1
+      log_message(paste0("Warning: CTNNB1 state '", state, "' not found, using default values\n"), print_to_console = TRUE)
+    }
+  }
+  
+  # Check heatmap data
+  log_message("\nHeatmap data summary:\n", print_to_console = TRUE)
+  log_message(paste0("Rows: ", nrow(heatmap_data), "\n"), print_to_console = TRUE)
+  log_message(paste0("Columns: ", ncol(heatmap_data), "\n"), print_to_console = TRUE)
+  log_message(paste0("Column names: ", toString(colnames(heatmap_data)), "\n"), print_to_console = TRUE)
+  
+  # Ensure data contains required columns
+  required_cols <- c("AgentState", "TP53_Change", "CTNNB1_Change", "TP53_P_Value", "CTNNB1_P_Value")
+  missing_cols <- setdiff(required_cols, colnames(heatmap_data))
+  if (length(missing_cols) > 0) {
+    error_msg <- paste0("Error: Heatmap data missing required columns: ", paste(missing_cols, collapse = ", "))
+    log_message(paste0(error_msg, "\n"), print_to_console = TRUE)
+    stop(error_msg)
+  }
+  
+  # Create heatmap matrix
+  heatmap_matrix <- as.matrix(heatmap_data[, c("TP53_Change", "CTNNB1_Change")])
+  rownames(heatmap_matrix) <- heatmap_data$AgentState
+  
+  # P-value matrix for significance labeling
+  p_value_matrix <- as.matrix(heatmap_data[, c("TP53_P_Value", "CTNNB1_P_Value")])
+  rownames(p_value_matrix) <- heatmap_data$AgentState
+  
+  # Check matrix dimensions
+  log_message("\nMatrix dimensions:\n", print_to_console = TRUE)
+  log_message(paste0("Heatmap matrix: ", paste(dim(heatmap_matrix), collapse = " x "), "\n"), print_to_console = TRUE)
+  log_message(paste0("P-value matrix: ", paste(dim(p_value_matrix), collapse = " x "), "\n"), print_to_console = TRUE)
+  
+  # Check for NA values in matrix
+  if (any(is.na(heatmap_matrix))) {
+    log_message("Warning: Heatmap matrix contains NA values\n", print_to_console = TRUE)
+  }
+  if (any(is.na(p_value_matrix))) {
+    log_message("Warning: P-value matrix contains NA values\n", print_to_console = TRUE)
+  }
+  
+  # Sort heatmap matrix by absolute value of TP53 and CTNNB1 average change
+  avg_change <- rowMeans(heatmap_matrix)
+  # New sorting logic: sort by sign first, then by absolute value
+  sort_order <- order(
+    sign(avg_change),  # Sort by sign (-1, 0, 1) first
+    -abs(avg_change)   # Then sort by absolute value descending within each sign group
+  )
+  
+  # Apply new sorting
+  heatmap_matrix <- heatmap_matrix[sort_order, ]
+  p_value_matrix <- p_value_matrix[sort_order, ]
+  
+  # Restore heatmap color settings
+  max_abs_value <- max(abs(heatmap_matrix))
+  col_fun <- colorRamp2(
+    c(-max_abs_value, -max_abs_value/2, -max_abs_value/4, 0, max_abs_value/4, max_abs_value/2, max_abs_value),
+    c("#2C75B3",      "#5B9BD5",       "#9DC3E6",       "#F9EAE1", "#F4B183",      "#ED7D31",      "#C55A11") # Restore original gradient
+  )
+  
+  # Adjust column annotation color settings to match scatter plot style
+  column_ha <- HeatmapAnnotation(
+    Gene = c("TP53", "CTNNB1"),
+    col = list(
+      Gene = c("TP53" = "#D55E00", "CTNNB1" = "#0072B2") # TP53=Orange, CTNNB1=Blue
+    ),
+    show_annotation_name = TRUE,
+    annotation_name_gp = gpar(fontsize = col_fontsize)
+  )
+  
+  # Create heatmap, confirm column names are horizontal again
+  ht <- Heatmap(
+    heatmap_matrix,
+    name = "Activity Score Change",
+    col = col_fun,
+    row_names_gp = gpar(fontsize = row_fontsize),
+    column_names_gp = gpar(fontsize = col_fontsize, rot = 0),
+    top_annotation = column_ha,
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      p_val <- p_value_matrix[i, j]
+      star_text <-
+        if (p_val < 0.001) {
+          "***"
+        } else if (p_val < 0.01) {
+          "**"
+        } else if (p_val < 0.05) {
+          "*"
+        } else {
+          ""
+        }
+      if (star_text != "") {
+        grid.text(star_text, x, y, gp = gpar(fontsize = star_fontsize)) # Use star_fontsize parameter
+      }
+    },
+    column_title = "Effect of Mutant Genes on Agent States",
+    column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+    heatmap_legend_param = list(
+      title = "Activity Score Change",
+      at = round(seq(-max_abs_value, max_abs_value, length.out = 7), 2),
+      labels = round(seq(-max_abs_value, max_abs_value, length.out = 7), 2),
+      legend_height = unit(4, "cm"),
+      title_gp = gpar(fontsize = legend_title_fontsize),
+      labels_gp = gpar(fontsize = legend_labels_fontsize)
+    ),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    border = TRUE,
+    rect_gp = gpar(col = "white", lwd = 0.5)
+  )
+  
+  # Print heatmap to current device
+  print(ht)
+  
+  # Return heatmap data and P-value matrix
+  return(list(
+    heatmap_data = heatmap_data,
+    p_value_matrix = p_value_matrix
+  ))
+}
+
+# Plot comparison of TP53 and CTNNB1 mutation effects on specific pathways - Add error handling
+plot_pathway_comparison <- function(tp53_data, ctnnb1_data, pathways, output_dir, simplify_names = FALSE) {
+  log_message("Plotting comparison of TP53 and CTNNB1 mutation effects on specific pathways...\n", print_to_console = TRUE)
+  
+  # Extract data for specific pathways - Use tryCatch to handle errors
+  tp53_subset <- tryCatch({
+    # Try using dplyr filter/mutate/select
+    tp53_data %>%
+      filter(AgentState %in% pathways) %>%
+      mutate(
+        Gene = "TP53",
+        Change = Mean_Score_Mutant - Mean_Score_WT,
+        Significance = ifelse(P_Value < 0.05, "Significant", "Non-significant")
+      ) %>%
+      select(AgentState, Gene, Change, P_Value, Significance)
+  }, error = function(e) {
+    log_message(paste0("dplyr filter/mutate/select failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R functions
+    result <- tp53_data[tp53_data$AgentState %in% pathways, ]
+    result$Gene <- "TP53"
+    result$Change <- result$Mean_Score_Mutant - result$Mean_Score_WT
+    result$Significance <- ifelse(result$P_Value < 0.05, "Significant", "Non-significant")
+    
+    # Only keep needed columns
+    result <- result[, c("AgentState", "Gene", "Change", "P_Value", "Significance")]
+    
+    return(result)
+  })
+  
+  ctnnb1_subset <- tryCatch({
+    # Try using dplyr filter/mutate/select
+    ctnnb1_data %>%
+      filter(AgentState %in% pathways) %>%
+      mutate(
+        Gene = "CTNNB1",
+        Change = Mean_Score_Mutant - Mean_Score_WT,
+        Significance = ifelse(P_Value < 0.05, "Significant", "Non-significant")
+      ) %>%
+      select(AgentState, Gene, Change, P_Value, Significance)
+  }, error = function(e) {
+    log_message(paste0("dplyr filter/mutate/select failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R functions
+    result <- ctnnb1_data[ctnnb1_data$AgentState %in% pathways, ]
+    result$Gene <- "CTNNB1"
+    result$Change <- result$Mean_Score_Mutant - result$Mean_Score_WT
+    result$Significance <- ifelse(result$P_Value < 0.05, "Significant", "Non-significant")
+    
+    # Only keep needed columns
+    result <- result[, c("AgentState", "Gene", "Change", "P_Value", "Significance")]
+    
+    return(result)
+  })
+  
+  # Combine data
+  combined_data <- rbind(tp53_subset, ctnnb1_subset)
+  
+  # Decide whether to simplify pathway names based on parameter
+  if (simplify_names) {
+    # Simplify pathway names, remove "KEGG_" prefix
+    combined_data$AgentState <- gsub("KEGG_", "", combined_data$AgentState)
+    combined_data$AgentState <- gsub("_PATHWAY", "", combined_data$AgentState)
+    combined_data$AgentState <- gsub("_", " ", combined_data$AgentState)
+  }
+  
+  # Sort pathways descending by absolute change for better display
+  pathway_order <- tryCatch({
+    # Modify dplyr code to adapt to different versions
+    combined_data %>%
+      group_by(AgentState) %>%
+      summarise(mean_abs_change = mean(abs(Change))) %>%
+      ungroup() %>%  # Ensure ungrouping
+      arrange(desc(mean_abs_change)) %>%
+      pull(AgentState)
+  }, error = function(e) {
+    log_message(paste0("dplyr group_by/summarize/arrange/pull failed, using basic R functions. Error: ", e$message, "\n"), print_to_console = TRUE)
+    
+    # Use basic R functions as alternative
+    agg_data <- aggregate(abs(Change) ~ AgentState, data = combined_data, FUN = mean)
+    colnames(agg_data)[2] <- "mean_abs_change"
+    ordered_data <- agg_data[order(agg_data$mean_abs_change, decreasing = TRUE), ]
+    return(ordered_data$AgentState)
+  })
+  
+  combined_data$AgentState <- factor(combined_data$AgentState, levels = pathway_order)
+  
+  # Plot comparison chart (adjust colors to match scatter plot style)
+  p <- ggplot(combined_data, aes(x = AgentState, y = Change, fill = Gene)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_fill_manual(values = c("TP53" = "#D55E00", "CTNNB1" = "#0072B2")) + # TP53=Orange, CTNNB1=Blue
+    geom_text(aes(label = ifelse(Significance == "Significant", "*", ""),
+                  y = ifelse(Change >= 0, Change + 0.02, Change - 0.02)),
+              position = position_dodge(width = 0.8),
+              vjust = ifelse(combined_data$Change >= 0, 0, 1),
+              size = 5) +
+    coord_flip() +
+    theme_publication(base_size = 14) +
+    labs(
+      title = "Comparison of TP53 and CTNNB1 Mutations on Metabolism Pathways",
+      y = "Activity Score Change (Mutant - Wild Type)",
+      x = "",
+      fill = "Mutant Gene"
+    )
+  
+  # Save pathway comparison data
+  comparison_csv <- file.path(output_dir, "Figure5C_Metabolism_Pathway_Comparison_Data.csv")
+  write.csv(combined_data, comparison_csv, row.names = FALSE)
+  log_message(paste0("Saved pathway comparison data: ", comparison_csv, "\n"), print_to_console = TRUE)
+  
+  return(p)
+}
+
+# Plot scatter plot showing correlation of TP53 and CTNNB1 mutation effects on all states - Add error handling
+plot_correlation <- function(tp53_data, ctnnb1_data, output_dir, highlight_pathways = NULL) {
+  log_message("Plotting scatter plot of correlation between TP53 and CTNNB1 mutation effects on agent states...\n", print_to_console = TRUE)
+  
+  # Calculate change for each state
+  tp53_fc <- tp53_data %>%
+    mutate(Change_TP53 = Mean_Score_Mutant - Mean_Score_WT) %>%
+    select(AgentState, Change_TP53, P_Value) %>%
+    rename(P_Value_TP53 = P_Value)
+  
+  ctnnb1_fc <- ctnnb1_data %>%
+    mutate(Change_CTNNB1 = Mean_Score_Mutant - Mean_Score_WT) %>%
+    select(AgentState, Change_CTNNB1, P_Value) %>%
+    rename(P_Value_CTNNB1 = P_Value)
+  
+  # Merge data
+  merged_data <- tp53_fc %>%
+    inner_join(ctnnb1_fc, by = "AgentState") %>%
+    mutate(
+      Quadrant = case_when(
+        P_Value_TP53 < 0.05 & P_Value_CTNNB1 < 0.05 & Change_TP53 > 0 & Change_CTNNB1 > 0 ~ "Both Up",
+        P_Value_TP53 < 0.05 & P_Value_CTNNB1 < 0.05 & Change_TP53 < 0 & Change_CTNNB1 < 0 ~ "Both Down",
+        P_Value_TP53 < 0.05 & P_Value_CTNNB1 < 0.05 & Change_TP53 > 0 & Change_CTNNB1 < 0 ~ "TP53 Up, CTNNB1 Down",
+        P_Value_TP53 < 0.05 & P_Value_CTNNB1 < 0.05 & Change_TP53 < 0 & Change_CTNNB1 > 0 ~ "TP53 Down, CTNNB1 Up",
+        P_Value_TP53 < 0.05 & Change_TP53 > 0 ~ "TP53 Up Only",
+        P_Value_TP53 < 0.05 & Change_TP53 < 0 ~ "TP53 Down Only",
+        P_Value_CTNNB1 < 0.05 & Change_CTNNB1 > 0 ~ "CTNNB1 Up Only",
+        P_Value_CTNNB1 < 0.05 & Change_CTNNB1 < 0 ~ "CTNNB1 Down Only",
+        TRUE ~ "Not Significant"
+      ),
+      Highlight = AgentState %in% highlight_pathways,
+      Label = ifelse(AgentState %in% c("LipidMetabolism_Risk_LMRG", "KEGG_PROTEASOME"), 
+                     as.character(AgentState), 
+                     "")
+    )
+  
+  # Calculate correlation coefficient and R-squared
+  corr <- cor.test(merged_data$Change_TP53, merged_data$Change_CTNNB1)
+  lm_fit <- lm(Change_CTNNB1 ~ Change_TP53, data = merged_data)
+  r_squared <- summary(lm_fit)$r.squared
+  
+  # Restore scatter plot color settings (ensure consistency with original)
+  quadrant_colors <- c(
+    "Both Up" = "#D55E00", 
+    "Both Down" = "#0072B2",
+    "TP53 Up, CTNNB1 Down" = "#CC79A7",
+    "TP53 Down, CTNNB1 Up" = "#009E73",
+    "TP53 Up Only" = "#E69F00",
+    "TP53 Down Only" = "#56B4E9",
+    "CTNNB1 Up Only" = "#F0E442",
+    "CTNNB1 Down Only" = "#999999",
+    "Not Significant" = "grey80"
+  )
+  
+  # Plot scatter plot
+  p <- ggplot(merged_data, aes(x = Change_TP53, y = Change_CTNNB1)) +
+    # Add trend line
+    geom_smooth(method = "lm", color = "grey50", linetype = "dashed", se = TRUE, alpha = 0.2) +
+    # Add base points
+    geom_point(aes(color = Quadrant, size = -log10(pmin(P_Value_TP53, P_Value_CTNNB1))), 
+               alpha = ifelse(merged_data$Highlight, 1, 0.7)) +
+    # Highlight specific pathways
+    geom_point(data = subset(merged_data, Highlight), 
+              aes(color = Quadrant), size = 5, shape = 21, stroke = 2) +
+    # Add labels, only show key pathways, and increase font size
+    ggrepel::geom_text_repel(
+      data = subset(merged_data, Label != ""),
+      aes(label = Label),
+      size = 5, # Increased font size from 4 to 5
+      box.padding = 0.8,
+      segment.alpha = 0.8,
+      force = 10,
+      min.segment.length = 0,
+      max.overlaps = Inf
+    ) +
+    # Add reference lines
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    # Set colors and size
+    scale_color_manual(values = quadrant_colors) +
+    scale_size_continuous(range = c(1, 5)) +
+    # Set title and labels
+    labs(
+      title = "Correlation of TP53 and CTNNB1 Mutation Effects",
+      subtitle = sprintf("Pearson R = %.2f (P = %.2e), R² = %.2f", 
+                        corr$estimate, corr$p.value, r_squared),
+      x = "Activity Change by TP53 Mutation (Log2FC)",
+      y = "Activity Change by CTNNB1 Mutation (Log2FC)",
+      color = "Change Pattern",
+      size = "-log10(P-value)"
+    ) +
+    theme_publication(base_size = 22) # Specify larger base font size, e.g., 22
+  
+  # Save correlation scatter plot data
+  correlation_csv <- file.path(output_dir, "Figure5F_Correlation_Data.csv")
+  write.csv(merged_data, correlation_csv, row.names = FALSE)
+  log_message(paste0("Saved correlation scatter plot data: ", correlation_csv, "\n"), print_to_console = TRUE)
+  
+  # Save correlation statistics
+  correlation_stats <- data.frame(
+    correlation_coefficient = corr$estimate,
+    p_value = corr$p.value,
+    r_squared = r_squared,
+    conf_int_lower = corr$conf.int[1],
+    conf_int_upper = corr$conf.int[2]
+  )
+  stats_csv <- file.path(output_dir, "Figure5F_Correlation_Statistics.csv")
+  write.csv(correlation_stats, stats_csv, row.names = FALSE)
+  log_message(paste0("Saved correlation statistics: ", stats_csv, "\n"), print_to_console = TRUE)
+  
+  return(p)
+}
+
+# Main function - Add error handling
+main <- function(output_dir = "../results") {
+  # Load packages
+  load_packages()
+  # No need to load theme again as it's globally defined
+  
+  # Read data
+  data <- read_data()
+  tp53_data <- data$tp53_data
+  ctnnb1_data <- data$ctnnb1_data
+  output_dir <- data$output_dir
+  
+  # Ensure output directory exists
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+    log_message(paste0("Created output directory: ", output_dir, "\n"), print_to_console = TRUE)
+  }
+  
+  # Filter significant results
+  tp53_significant <- filter_significant_results(tp53_data)
+  ctnnb1_significant <- filter_significant_results(ctnnb1_data)
+  
+  # Save filtered significant results
+  write.csv(tp53_significant, file.path(output_dir, "Figure5_TP53_Significant_Results.csv"), row.names = FALSE)
+  write.csv(ctnnb1_significant, file.path(output_dir, "Figure5_CTNNB1_Significant_Results.csv"), row.names = FALSE)
+  log_message("Saved significance filtering results\n", print_to_console = TRUE)
+  
+  # Ensure correct output directory used
+  results_dir <- output_dir
+  log_message(paste0("Using output directory: ", results_dir, "\n"), print_to_console = TRUE)
+  
+  tryCatch({
+    # Plot volcano plots
+    tp53_volcano <- plot_volcano(tp53_data, "TP53", output_dir)
+    ctnnb1_volcano <- plot_volcano(ctnnb1_data, "CTNNB1", output_dir)
+    
+    # Save volcano plots
+    ggsave(file.path(results_dir, "Figure5A_TP53_Volcano.pdf"), tp53_volcano, width = 10, height = 8)
+    ggsave(file.path(results_dir, "Figure5B_CTNNB1_Volcano.pdf"), ctnnb1_volcano, width = 10, height = 8)
+    log_message(paste0("Volcano plots saved to: ", results_dir, "\n"), print_to_console = TRUE)
+  }, error = function(e) {
+    log_message(paste0("Error plotting or saving volcano plots: ", e$message, "\n"), print_to_console = TRUE)
+  })
+  
+  tryCatch({
+    # Plot all pathways heatmap (using default font sizes)
+    # pdf(file.path(results_dir, "Figure5_All_Heatmap.pdf"), width = 10, height = 12)
+    # heatmap_result <- plot_heatmap(tp53_significant, ctnnb1_significant, output_dir)
+    # dev.off()
+    # log_message(paste0("All pathways heatmap saved to: ", results_dir, "/Figure5_All_Heatmap.pdf\n"), 
+    #             print_to_console = TRUE)
+    
+    # Save data for all pathways heatmap
+    # Prepare TP53 data
+    tp53_all_data <- tp53_significant %>%
+      select(AgentState, Mean_Score_Mutant, Mean_Score_WT, P_Value) %>%
+      rename(
+        TP53_Mean_Score_Mutant = Mean_Score_Mutant,
+        TP53_Mean_Score_WT = Mean_Score_WT,
+        TP53_P_Value = P_Value
+      )
+    
+    # Prepare CTNNB1 data
+    ctnnb1_all_data <- ctnnb1_significant %>%
+      select(AgentState, Mean_Score_Mutant, Mean_Score_WT, P_Value) %>%
+      rename(
+        CTNNB1_Mean_Score_Mutant = Mean_Score_Mutant,
+        CTNNB1_Mean_Score_WT = Mean_Score_WT,
+        CTNNB1_P_Value = P_Value
+      )
+    
+    # Combine data
+    all_pathways_data <- full_join(tp53_all_data, ctnnb1_all_data, by = "AgentState")
+    
+    # Export raw data for all pathways heatmap
+    write.csv(all_pathways_data, file.path(results_dir, "Figure5_All_Heatmap_Data.csv"), row.names = FALSE)
+    log_message(paste0("Raw data for all pathways heatmap saved to: ", results_dir, "/Figure5_All_Heatmap_Data.csv\n"), 
+                print_to_console = TRUE)
+    
+    # Save P-value matrix data for all pathways heatmap
+    write.csv(as.data.frame(heatmap_result$p_value_matrix), file.path(results_dir, "Figure5_All_Heatmap_PValues.csv"), row.names = TRUE)
+    log_message(paste0("P-value matrix data for all pathways heatmap saved to: ", results_dir, "/Figure5_All_Heatmap_PValues.csv\n"), 
+                print_to_console = TRUE)
+  
+    # Define comprehensive immune suppression microenvironment related pathways
+    all_immune_pathways <- c(
+      # CTNNB1 related pathways
+      "T_cell_co_stimulation",
+      "T_cell_co_inhibition",
+      "APC_co_stimulation",
+      "Check_point",
+      "CCR",
+      "Th1_cells",
+      # TP53 related pathways
+      "CytokineSignaling_HighRisk_CSIRG"
+    )
+    
+    # Filter data for these pathways
+    tp53_all_immune <- tp53_data[tp53_data$AgentState %in% all_immune_pathways, ]
+    ctnnb1_all_immune <- ctnnb1_data[ctnnb1_data$AgentState %in% all_immune_pathways, ]
+    
+    # Check if data available to plot
+    if (nrow(tp53_all_immune) > 0 || nrow(ctnnb1_all_immune) > 0) {
+      log_message("Starting to plot immune pathway heatmap...\n", print_to_console = TRUE)
+    
+    # Plot comprehensive immune related pathway heatmap (specify larger font sizes)
+      pdf(file.path(results_dir, "Figure5D_Key_Immune_Pathways_Heatmap.pdf"), width = 10, height = 8)
+      heatmap_result <- plot_heatmap(
+      tp53_all_immune, ctnnb1_all_immune, output_dir, 
+      top_n = length(all_immune_pathways), # Set top_n to length of all_immune_pathways to show all immune related pathways
+      row_fontsize = 12,         # Increase row label font size
+      col_fontsize = 14,         # Increase column label font size
+      legend_title_fontsize = 12,# Increase legend title font size
+      legend_labels_fontsize = 10,# Increase legend labels font size
+      star_fontsize = 12         # Increase star font size
+    )
+    dev.off()
+      log_message("Immune pathway heatmap plotting completed\n", print_to_console = TRUE)
+      
+      # Export raw data for immune pathway heatmap
+      immune_raw_data_file <- file.path(results_dir, "Figure5D_Key_Immune_Pathways_Heatmap_Data.csv")
+      write.csv(heatmap_result$heatmap_data, immune_raw_data_file, row.names = FALSE)
+      log_message(paste0("Raw data for immune pathway heatmap saved to: ", immune_raw_data_file, "\n"), 
+                  print_to_console = TRUE)
+      
+      # Save P-value matrix data
+      immune_pvalue_file <- file.path(results_dir, "Figure5D_Key_Immune_Pathways_Heatmap_PValues.csv")
+      write.csv(as.data.frame(heatmap_result$p_value_matrix), immune_pvalue_file, row.names = TRUE)
+      log_message(paste0("P-value matrix data for immune pathway heatmap saved to: ", immune_pvalue_file, "\n"), 
+                print_to_console = TRUE)
+    
+    # # Save comprehensive immune related pathways data
+    # all_immune_pathways_df <- data.frame(pathway = all_immune_pathways)
+    # write.csv(all_immune_pathways_df, file.path(results_dir, "Figure5D_Immune_Pathways.csv"), row.names = FALSE)
+    # log_message("Saved comprehensive immune related pathways list\n", print_to_console = TRUE)
+    } else {
+      log_message("Warning: Not enough immune pathway data found to generate heatmap.\n", print_to_console = TRUE)
+    }
+  }, error = function(e) {
+    log_message(paste0("Error plotting or saving heatmap: ", e$message, "\n"), print_to_console = TRUE)
+  })
+  
+  tryCatch({
+    # Define pathways to highlight
+    highlight_pathways <- c(
+      "LipidMetabolism_Risk_LMRG",  # Lipid metabolism pathway
+      "KEGG_PROTEASOME"             # Proteasome pathway
+    )
+    
+    # Plot correlation scatter plot with highlighted pathways
+    correlation_plot <- plot_correlation(
+      tp53_data = tp53_data,
+      ctnnb1_data = ctnnb1_data,
+      output_dir = output_dir,
+      highlight_pathways = highlight_pathways
+    )
+    
+    # Save correlation scatter plot
+    ggsave(
+      file.path(results_dir, "Figure5F_Pathway_Correlation.pdf"),
+      correlation_plot,
+      width = 14,
+      height = 10,
+      dpi = 300
+    )
+    log_message(paste0("Correlation scatter plot with highlighted pathways saved to: ", results_dir, "\n"), 
+                print_to_console = TRUE)
+  }, error = function(e) {
+    log_message(paste0("Error plotting or saving correlation scatter plot: ", e$message, "\n"), 
+                print_to_console = TRUE)
+  })
+  
+  # --- Restore: Plot metabolism pathway comparison --- 
+  tryCatch({
+    # Define list of important Metabolism related pathways
+    important_pathways <- c(
+      "LipidMetabolism_Risk_LMRG",
+      "Metabolism_General_Risk_MRG",
+      "KEGG_FATTY_ACID_METABOLISM",
+      "KEGG_DRUG_METABOLISM_CYTOCHROME_P450",
+      "KEGG_RETINOL_METABOLISM",
+      "KEGG_TRYPTOPHAN_METABOLISM"
+    )
+    
+    # # Save important pathway list
+    # pathways_df <- data.frame(pathway = important_pathways)
+    # write.csv(pathways_df, file.path(results_dir, "Figure5_Important_Pathways.csv"), row.names = FALSE)
+    # log_message("Saved important pathway list\n", print_to_console = TRUE)
+    
+    # Plot pathway comparison with simplified names
+    p_simplified <- plot_pathway_comparison(
+      tp53_data = tp53_data,
+      ctnnb1_data = ctnnb1_data,
+      pathways = important_pathways,
+      output_dir = output_dir,
+      simplify_names = FALSE  # Changed to FALSE to keep original pathway names
+    )
+    
+    # Save pathway comparison with original names
+    simplified_pdf <- file.path(output_dir, "Figure5C_Metabolism_Pathway_Comparison.pdf")
+    ggsave(simplified_pdf, p_simplified, width = 12, height = 8)  # Increase figure size to fit longer names
+    log_message(paste0("Pathway comparison with original names saved to: ", simplified_pdf, "\n"), print_to_console = TRUE)
+    
+  }, error = function(e) {
+    # Note: This captures errors related to plotting pathway comparison
+    log_message(paste0("Error plotting or saving pathway comparison: ", e$message, "\n"), print_to_console = TRUE)
+  })
+  # --- Restore End --- 
+  
+  # Log location of all saved figures
+  log_message(paste0("All saved violin plots generated in figure5.R are located in: ", results_dir, "\n"), print_to_console = TRUE)
+  log_message("Finished saving all individual figures, skipping figure combination step\n", print_to_console = TRUE)
+  log_message("Visualization of all key findings completed!\n", print_to_console = TRUE)
+}
+
+# Execute main function
+main()
+
+########################################################################################
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Optimized Survival Prediction Model for HCC Patients Based on Agent Activity Profiles - Python Implementation
+"""
+# -----------------------------------------------------------------------------
+# Logging Setup
+# -----------------------------------------------------------------------------
+
+def setup_logging(script_name):
+    """Setup logging"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"{script_name}_{timestamp}.log")
+    
+    class Logger(object):
+        def __init__(self, filename):
+            self.terminal = sys.stdout
+            self.log = open(filename, "w", encoding="utf-8")
+       
+        def write(self, message):
+            self.terminal.write(message)
+            self.log.write(message)
+            self.log.flush()
+            
+        def flush(self):
+            self.terminal.flush()
+            self.log.flush()
+    
+    sys.stdout = Logger(log_file)
+    print(f"Starting data preparation script, time: {timestamp}")
+    return log_file, timestamp
+
+# -----------------------------------------------------------------------------
+# Import Necessary Libraries
+# -----------------------------------------------------------------------------
+import os
+import sys
+import time
+import pickle
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib import cm
+import matplotlib.colors as mcolors
+import logging
+import joblib
+from datetime import datetime  # Added datetime module
+import warnings
+
+# Machine Learning Libraries
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score, StratifiedKFold, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.metrics import roc_auc_score, roc_curve, auc, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve
+from sklearn.metrics import average_precision_score
+from imblearn.over_sampling import SMOTE
+import xgboost as xgb
+from xgboost import XGBClassifier
+from sklearn.ensemble import VotingClassifier, StackingClassifier
+from sklearn.base import clone
+from sklearn.neural_network import MLPClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+
+# Set plotting style
+# plt.style.use('seaborn-whitegrid')  # Old version style name
+try:
+    # Try using new version style name
+    plt.style.use('seaborn-v0_8-whitegrid')
+except:
+    # If failed, use default style
+    plt.style.use('default')
+    
+sns.set_style("whitegrid")
+plt.rcParams['axes.grid'] = True
+plt.rcParams['figure.figsize'] = [10, 6]
+plt.rcParams['figure.dpi'] = 100
+
+# Set fonts for Chinese and English support
+try:
+    plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'Arial', 'Songti SC']  # For correct display of Chinese and English labels
+    plt.rcParams['axes.unicode_minus'] = False  # For correct display of minus signs
+except:
+    print("Warning: Font setting failed, charts may not display characters correctly")
+
+# 0. Configure Logging
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"survival_prediction_optimized_py_{timestamp}.log")
+
+# Redirect output to log file and console
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+   
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = Logger(log_file)
+
+print(f"Starting optimized model script, time: {timestamp}")
+
+# Define generate_summary_report function at the beginning
+def generate_summary_report(results, best_model_name, feature_importance_df, selected_features, output_dir):
+    """
+    Generate a comprehensive report for model training and evaluation
+    """
+    report = []
+    
+    # 1. Dataset Information
+    report.append("# Model Training and Evaluation Report\n")
+    report.append("## 1. Dataset Information\n")
+    report.append(f"- Number of features: {len(selected_features)}")
+    
+    # 2. Model Performance
+    report.append("\n## 2. Model Performance\n")
+    report.append("### Best Model Performance\n")
+    report.append(f"- Best Model: {best_model_name}")
+    
+    # Get results for the best model
+    test_results = results[f"{best_model_name}_Test"]
+    train_results = results[f"{best_model_name}_Train"]
+    
+    # Calculate overfitting metrics
+    train_auc = train_results['auc']
+    test_auc = test_results['auc']
+    overfitting_ratio = train_auc / test_auc if test_auc > 0 else float('inf')
+    
+    report.append(f"- Test Set AUC: {test_auc:.4f}")
+    report.append(f"- Test Set Accuracy: {test_results['accuracy']:.4f}")
+    
+    report.append("\n### Overfitting Analysis\n")
+    report.append(f"- Training Set AUC: {train_auc:.4f}")
+    report.append(f"- Test Set AUC: {test_auc:.4f}")
+    report.append(f"- Overfitting Ratio (Train AUC / Test AUC): {overfitting_ratio:.4f}")
+    
+    if overfitting_ratio > 1.2:
+        report.append("- ⚠️ Warning: Model may be overfitting")
+        report.append("  Suggested actions:")
+        report.append("  * Increase regularization strength")
+        report.append("  * Reduce model complexity")
+        report.append("  * Use cross-validation")
+    else:
+        report.append("- ✅ Model generalization performance is good")
+    
+    # 3. Feature Importance Analysis
+    report.append("\n## 3. Feature Importance Analysis\n")
+    report.append("### Top 10 Most Important Features\n")
+    top_10_features = feature_importance_df.head(10)
+    for _, row in top_10_features.iterrows():
+        report.append(f"- {row['Feature']}: {row['Importance']:.4f}")
+    
+    # 4. Generated Visualizations
+    report.append("\n## 4. Generated Visualizations\n")
+    report.append("The following visualizations have been saved in the output directory:")
+    report.append("1. ROC Curve Comparison")
+    report.append("2. PR Curve")
+    report.append("3. Confusion Matrix")
+    report.append("4. Feature Importance Plot")
+    report.append("5. Model Performance Radar Chart")
+    
+    # 5. Conclusions and Recommendations
+    report.append("\n## 5. Conclusions and Recommendations\n")
+    
+    # Performance assessment
+    if test_auc >= 0.8:
+        performance = "Excellent"
+    elif test_auc >= 0.7:
+        performance = "Good"
+    else:
+        performance = "Average"
+    
+    report.append(f"1. Overall model performance is {performance}, with a Test Set AUC of {test_auc:.4f}")
+    
+    # Recommendations based on overfitting
+    if overfitting_ratio > 1.5:
+        report.append("2. Model shows significant overfitting. Recommendations:")
+        report.append("   - Increase training data")
+        report.append("   - Use stronger regularization")
+        report.append("   - Simplify model structure")
+    elif overfitting_ratio > 1.2:
+        report.append("2. Model shows slight overfitting. Recommendations:")
+        report.append("   - Consider using cross-validation")
+        report.append("   - Appropriately increase regularization")
+    else:
+        report.append("2. Model generalization performance is good. Consider:")
+        report.append("   - Increasing model complexity")
+        report.append("   - Exploring more feature combinations")
+    
+    # Save report
+    report_path = os.path.join(output_dir, "Model_Summary_Report.md")
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(report))
+    
+    print(f"Model summary report generated: {report_path}")
+    return report_path
+
+# Add missing feature engineering functions
+def remove_redundant_features(X, features, correlation_threshold=0.8, return_pairs=False, return_corr=False):
+    """
+    Remove redundant features (high correlation features)
+    
+    Parameters:
+    X - Feature matrix
+    features - List of feature names
+    correlation_threshold - Correlation threshold, features higher than this will be considered redundant
+    return_pairs - Whether to return correlation pairs
+    return_corr - Whether to return correlation matrix
+    
+    Returns:
+    (Cleaned feature matrix, Cleaned feature name list, Correlation pairs, Correlation matrix)
+    """
+    print("\nAnalyzing feature correlation, removing redundant features...")
+    
+    # Convert feature matrix to DataFrame for correlation calculation
+    X_df = pd.DataFrame(X, columns=features)
+    
+    # Calculate correlation matrix between features
+    corr_matrix = np.abs(np.corrcoef(X.T))
+    np.fill_diagonal(corr_matrix, 0)  # Set diagonal values (feature correlation with itself) to 0
+    
+    # Find highly correlated feature pairs
+    redundant_pairs = []
+    n_features = len(features)
+    for i in range(n_features):
+        for j in range(i+1, n_features):
+            if corr_matrix[i, j] > correlation_threshold:
+                # Keep the feature with higher importance (here we use variance as a simple importance metric)
+                if np.var(X[:, i]) > np.var(X[:, j]):
+                    redundant_pairs.append((j, features[j], features[i], corr_matrix[i, j]))
+                else:
+                    redundant_pairs.append((i, features[i], features[j], corr_matrix[i, j]))
+    
+    # Construct set of features to remove
+    features_to_remove = set()
+    for idx, feature, paired_with, correlation in redundant_pairs:
+        features_to_remove.add(feature)
+        print(f"Feature '{feature}' is highly correlated with '{paired_with}' (r={correlation:.3f}) and will be removed")
+    
+    # Get indices of features to keep
+    keep_indices = [i for i, feature in enumerate(features) if feature not in features_to_remove]
+    
+    # Create cleaned feature set
+    X_clean = X[:, keep_indices]
+    features_clean = [features[i] for i in keep_indices]
+    
+    print(f"\nRemoved {len(features_to_remove)} redundant features, retained {len(features_clean)} features")
+    
+    returns = [X_clean, features_clean]
+    if return_pairs:
+        returns.append(redundant_pairs)
+    if return_corr:
+        returns.append(corr_matrix)
+    return tuple(returns)
+
+def create_interaction_features(X, features, top_n=10):
+    """
+    Create feature interaction terms
+    
+    Parameters:
+    X - Feature matrix
+    features - List of feature names
+    top_n - Number of top interaction features to select
+    
+    Returns:
+    (Interaction feature matrix, Interaction feature name list)
+    """
+    print("\nCreating feature interactions...")
+    
+    if len(features) < 2:
+        print("Insufficient features to create interaction features")
+        return None, []
+    
+    n_samples, n_features = X.shape
+    
+    # Create at most n_features*(n_features-1)/2 interaction features, but not exceeding top_n
+    max_interactions = min(int(n_features * (n_features - 1) / 2), 100, top_n)  # Limit max interaction features
+    
+    # Initialize interaction feature matrix and name list
+    X_interactions = np.zeros((n_samples, max_interactions))
+    interaction_names = []
+    
+    # Create all possible second-order interaction features
+    interaction_idx = 0
+    for i in range(n_features):
+        for j in range(i+1, n_features):
+            if interaction_idx >= max_interactions:
+                break
+            
+            # Create interaction feature (simple multiplication)
+            X_interactions[:, interaction_idx] = X[:, i] * X[:, j]
+            interaction_names.append(f"{features[i]}*{features[j]}")
+            interaction_idx += 1
+    
+    # Return None if no interaction features created
+    if interaction_idx == 0:
+        return None, []
+    
+    # Crop interaction feature matrix
+    X_interactions = X_interactions[:, :interaction_idx]
+    
+    print(f"Created {interaction_idx} feature interaction terms")
+    
+    return X_interactions, interaction_names
+
+# 1. Prepare Data
+# 1.1 Find and load processed data file
+print("Finding and loading preprocessed data file...")
+
+# Define possible data file paths
+data_paths = [
+    "results/survival_prediction_data.pkl",  # New preprocessed data
+    os.path.join(os.getcwd(), "results/survival_prediction_data.pkl")  # Absolute path
+]
+
+# Find existing file path
+data_file_path = None
+for path in data_paths:
+    if os.path.exists(path):
+        data_file_path = path
+        print(f"Found preprocessed data file: {data_file_path}")
+        break
+
+if data_file_path is None:
+    print("Error: Preprocessed data file not found. Please run check_data.py for data preprocessing first.")
+    sys.exit(1)
+
+# 1.2 Read preprocessed data
+try:
+    print("Reading preprocessed data...")
+    with open(data_file_path, 'rb') as f:
+        model_data = pickle.load(f)
+    print(f"Data shape: {model_data.shape}")
+    print(f"Data columns: {model_data.columns.tolist()[:5]} ... {model_data.columns.tolist()[-5:]}")
+    
+except Exception as e:
+    print(f"Error reading data file: {str(e)}")
+    sys.exit(1)
+
+# 1.3 Prepare model data
+print("Preparing model training data...")
+
+# Convert survival status to binary label
+if 'SurvivalStatus' in model_data.columns:
+    print("Using SurvivalStatus column as target variable...")
+    model_data['fustat'] = model_data['SurvivalStatus'].map({'Alive': 0, 'Dead': 1})
+    model_data['futime'] = model_data['OS']  # Use OS column as survival time
+elif 'fustat' not in model_data.columns:
+    print("Error: Survival status column not found.")
+    sys.exit(1)
+    
+# Print survival status statistics
+print("Survival status statistics:")
+print(model_data['fustat'].value_counts())
+
+# Extract features
+# Exclude non-feature columns
+exclude_cols = ['fustat', 'futime', 'SurvivalStatus', 'OS', 'TP53_Status', 'CTNNB1_Status', 'RiskGroup', 'PatientID_short']
+feature_cols = [col for col in model_data.columns if col not in exclude_cols]
+X = model_data[feature_cols]
+y = model_data['fustat']
+
+print(f"Number of features: {len(feature_cols)}")
+print(f"Number of samples: {X.shape[0]}")
+print("First 5 feature columns:", feature_cols[:5])
+
+# 2. Split Training and Test Sets
+print("Splitting training and test sets...")
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
+)
+
+print(f"Number of samples in training set: {X_train.shape[0]}")
+print(f"Number of samples in test set: {X_test.shape[0]}")
+
+# Print sample count for each class in training set
+print("Training set survival status statistics:")
+print(y_train.value_counts())
+
+# Print sample count for each class in test set
+print("Test set survival status statistics:")
+print(y_test.value_counts())
+
+# 3. Data Preprocessing
+print("Performing data preprocessing...")
+
+# 3.1 Standardize features
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# 3.2 Handle class imbalance (if necessary)
+# Check class imbalance ratio
+class_counts = y_train.value_counts()
+imbalance_ratio = class_counts[0] / class_counts[1] if class_counts[1] > 0 else float('inf')
+print(f"Class imbalance ratio: {imbalance_ratio:.2f}")
+
+# Use SMOTE if imbalance ratio exceeds 2:1
+use_smote = imbalance_ratio > 2.0 or 1.0 / imbalance_ratio > 2.0
+if use_smote:
+    print("Using SMOTE to handle class imbalance...")
+    smote = SMOTE(random_state=42)
+    X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
+    print(f"Training set size after SMOTE: {X_train_balanced.shape[0]}")
+    print("Training set class distribution after SMOTE:")
+    print(pd.Series(y_train_balanced).value_counts())
+    
+    # Use balanced data
+    X_train_final = X_train_balanced
+    y_train_final = y_train_balanced
+else:
+    print("Class distribution relatively balanced, skipping SMOTE...")
+    X_train_final = X_train_scaled
+    y_train_final = y_train
+
+# 4. Feature Selection
+print("Performing feature selection...")
+
+# 1. Calculate feature importance first, but don't select yet
+feature_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+feature_selector.fit(X_train_final, y_train_final)
+
+# Get feature importance
+importances = feature_selector.feature_importances_
+feature_importance_df = pd.DataFrame({
+    'Feature': feature_cols,
+    'Importance': importances
+})
+feature_importance_df = feature_importance_df.sort_values('Importance', ascending=False)
+
+# 5. Create output directory
+output_dir = "results/survival_prediction_optimized_py"
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    
+print(f"Output directory: {output_dir}")
+
+# Save original feature importance
+feature_importance_csv = os.path.join(output_dir, "1.Original_Feature_Importance.csv")
+feature_importance_df.to_csv(feature_importance_csv, index=False)
+print(f"Saved original feature importance: {feature_importance_csv}")
+
+# 2. Analyze feature correlation and remove redundant features - Do this before feature selection
+print("\nAnalyzing feature correlation first, removing redundant features...")
+X_train_cleaned, cleaned_feature_names, redundant_pairs, corr_matrix = remove_redundant_features(
+    X_train_final, feature_cols, correlation_threshold=0.8, return_pairs=True, return_corr=True
+)
+X_test_cleaned = X_test_scaled[:, [feature_cols.index(f) for f in cleaned_feature_names]]
+
+# Export correlation analysis results to csv
+correlation_csv = os.path.join(output_dir, "2_1.feature_correlation_removed.csv")
+if redundant_pairs:
+    pd.DataFrame(redundant_pairs, columns=["Index", "Removed_Feature", "Paired_With", "Correlation"]).to_csv(correlation_csv, index=False)
+    print(f"Correlation analysis results exported to: {correlation_csv}")
+else:
+    print("No highly correlated features removed, skipping export.")
+
+# Export correlation matrix of all features (original features) to csv
+all_corr_csv = os.path.join(output_dir, "2.all_feature_correlation.csv")
+pd.DataFrame(corr_matrix, index=feature_cols, columns=feature_cols).to_csv(all_corr_csv)
+print(f"Correlation matrix of all features exported to: {all_corr_csv}")
+
+# New: Export correlation matrix of removed redundant features
+removed_features = [x[1] for x in redundant_pairs] if redundant_pairs else []
+if removed_features:
+    # Deduplicate to ensure unique rows/cols
+    removed_features_unique = list(dict.fromkeys(removed_features))
+    removed_corr = pd.DataFrame(corr_matrix, index=feature_cols, columns=feature_cols).loc[removed_features_unique, removed_features_unique]
+    removed_corr_csv = os.path.join(output_dir, "2_1.removed_feature_correlation.csv")
+    removed_corr.to_csv(removed_corr_csv)
+    print(f"Correlation matrix of removed redundant features exported to: {removed_corr_csv}")
+
+# New: Export correlation matrix of finally retained features
+if cleaned_feature_names:
+    cleaned_corr = pd.DataFrame(corr_matrix, index=feature_cols, columns=feature_cols).loc[cleaned_feature_names, cleaned_feature_names]
+    cleaned_corr_csv = os.path.join(output_dir, "2_2.cleaned_feature_correlation.csv")
+    cleaned_corr.to_csv(cleaned_corr_csv)
+    print(f"Correlation matrix of retained features exported to: {cleaned_corr_csv}")
+
+# 3. Recalculate feature importance on cleaned feature set
+print("\nRecalculating feature importance on cleaned feature set...")
+clean_selector = RandomForestClassifier(n_estimators=100, random_state=42)
+clean_selector.fit(X_train_cleaned, y_train_final)
+
+clean_importances = clean_selector.feature_importances_
+clean_indices = np.argsort(clean_importances)[::-1]
+clean_feature_importance_df = pd.DataFrame({
+    'Feature': cleaned_feature_names,
+    'Importance': clean_importances
+}).sort_values('Importance', ascending=False)
+
+# Save cleaned feature importance
+clean_importance_csv = os.path.join(output_dir, "2_2.Cleaned_Feature_Importance.csv")
+clean_feature_importance_df.to_csv(clean_importance_csv, index=False)
+print(f"Saved cleaned feature importance: {clean_importance_csv}")
+
+# 4. Select optimal number of features based on cleaned feature set using cross-validation
+# Calculate cumulative importance
+clean_cumulative_importance = np.cumsum(clean_importances[clean_indices])
+
+def analyze_cleaned_feature_selection(X_train, y_train, X_test, y_test, feature_indices, importances, 
+                            thresholds=[5, 10, 15, 20, 25], cv=5):
+    """
+    Analyze model performance with different number of features and determine optimal number
+    """
+    results = []
+    feature_count = len(feature_indices)
+    # Adjust thresholds to ensure they don't exceed available feature count
+    thresholds = [t for t in thresholds if t <= feature_count]
+    
+    # Create a baseline model for each feature count
+    base_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    
+    # Calculate feature counts at different cumulative importance thresholds
+    importance_thresholds = [0.8, 0.85, 0.9, 0.95]
+    features_at_threshold = []
+    for threshold in importance_thresholds:
+        try:
+            features_needed = np.where(clean_cumulative_importance >= threshold)[0][0] + 1
+            if features_needed <= feature_count:
+                features_at_threshold.append(features_needed)
+        except IndexError:
+            pass  # Skip if condition not met
+    
+    # Merge fixed counts and threshold-based counts
+    all_n_features = sorted(list(set(thresholds + features_at_threshold)))
+    
+    for n_features in all_n_features:
+        if n_features > len(feature_indices):
+            continue
+            
+        selected_indices = feature_indices[:n_features]
+        X_train_selected = X_train[:, selected_indices]
+        X_test_selected = X_test[:, selected_indices]
+        
+        # Cross-validation scores
+        cv_scores = cross_val_score(base_model, X_train_selected, y_train, cv=cv, scoring='roc_auc')
+        
+        # Evaluate on test set
+        model = base_model.fit(X_train_selected, y_train)
+        test_auc = roc_auc_score(y_test, model.predict_proba(X_test_selected)[:, 1])
+        
+        # Calculate cumulative importance for this feature set
+        cumulative_imp = clean_cumulative_importance[n_features-1] if n_features-1 < len(clean_cumulative_importance) else 1.0
+        
+        results.append({
+            'n_features': n_features,
+            'cv_auc_mean': cv_scores.mean(),
+            'cv_auc_std': cv_scores.std(),
+            'test_auc': test_auc,
+            'cumulative_importance': cumulative_imp
+        })
+    
+    return pd.DataFrame(results)
+
+print("\nAnalyzing model performance with different number of features based on cleaned feature set...")
+cleaned_feature_analysis = analyze_cleaned_feature_selection(
+    X_train_cleaned, y_train_final, 
+    X_test_cleaned, y_test,
+    clean_indices, clean_importances
+)
+
+# Save cleaned feature selection analysis results
+clean_feature_analysis_csv = os.path.join(output_dir, "3.Cleaned_Feature_Selection_Analysis.csv")
+cleaned_feature_analysis.to_csv(clean_feature_analysis_csv, index=False)
+print(f"Saved cleaned feature selection analysis results: {clean_feature_analysis_csv}")
+
+# Visualize cleaned feature selection analysis results
+plt.figure(figsize=(12, 8))
+plt.plot(cleaned_feature_analysis['n_features'], cleaned_feature_analysis['cv_auc_mean'], 'b-', label='CV AUC')
+plt.fill_between(cleaned_feature_analysis['n_features'],
+                 cleaned_feature_analysis['cv_auc_mean'] - cleaned_feature_analysis['cv_auc_std'],
+                 cleaned_feature_analysis['cv_auc_mean'] + cleaned_feature_analysis['cv_auc_std'],
+                 alpha=0.2)
+plt.plot(cleaned_feature_analysis['n_features'], cleaned_feature_analysis['test_auc'], 'r--', label='Test AUC')
+plt.xlabel('Number of Features')
+plt.ylabel('AUC Score')
+plt.title('Model Performance vs Number of Features (After Removing Redundancy)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# Add secondary axis for cumulative importance
+ax2 = plt.twinx()
+ax2.plot(cleaned_feature_analysis['n_features'], cleaned_feature_analysis['cumulative_importance'],
+         'g-.', label='Cumulative Importance')
+ax2.set_ylabel('Cumulative Importance')
+ax2.legend(loc='lower right')
+
+# Save chart
+clean_feat_analysis_png = os.path.join(output_dir, "3_1.Cleaned_Feature_Selection_Analysis.png")
+plt.savefig(clean_feat_analysis_png, bbox_inches='tight', dpi=300)
+print(f"Saved cleaned feature selection analysis plot: {clean_feat_analysis_png}")
+plt.close()
+
+# 5. Select optimal feature count based on analysis results
+if not cleaned_feature_analysis.empty:
+    best_n_features = cleaned_feature_analysis.loc[cleaned_feature_analysis['cv_auc_mean'].idxmax(), 'n_features']
+    print(f"\nOptimal feature number based on CV performance: {best_n_features}")
+
+    # Use optimal feature count
+    n_top_features = int(best_n_features)
+    top_feature_indices = clean_indices[:n_top_features]
+    final_selected_features = [cleaned_feature_names[i] for i in top_feature_indices]
+
+    print(f"\nSelected {n_top_features} most important features:")
+    for i, feature in enumerate(final_selected_features[:10]):
+        orig_importance = feature_importance_df[feature_importance_df['Feature'] == feature]['Importance'].values[0]
+        cleaned_importance = clean_feature_importance_df[clean_feature_importance_df['Feature'] == feature]['Importance'].values[0]
+        print(f"{i+1}. {feature} (Orig Importance: {orig_importance:.4f}, Cleaned Importance: {cleaned_importance:.4f})")
+    if n_top_features > 10:
+        print("...")
+
+    # Optimization: Output feature names and importance values
+    selected_features_df = pd.DataFrame({
+        'Feature': final_selected_features,
+        'Importance': clean_importances[top_feature_indices]
+    })
+    selected_features_df = selected_features_df.sort_values('Importance', ascending=False)
+    cv_selected_features_csv = os.path.join(output_dir, "4.cv_selected_features.csv")
+    selected_features_df.to_csv(cv_selected_features_csv, index=False)
+    print(f"CV selected features exported to: {cv_selected_features_csv}")
+
+    # Use selected features
+    X_train_selected = X_train_cleaned[:, top_feature_indices]
+    X_test_selected = X_test_cleaned[:, top_feature_indices]
+    selected_features = final_selected_features
+else:
+    # If analysis result is empty, use all cleaned features
+    print("\nUnable to determine optimal feature count, using all cleaned features")
+    X_train_selected = X_train_cleaned
+    X_test_selected = X_test_cleaned
+    selected_features = cleaned_feature_names
+
+# Execute feature engineering - Move before model training
+print("Executing feature engineering...")
+
+# Redundant features already removed, proceed with selected features
+X_train_enhanced = X_train_selected.copy()
+X_test_enhanced = X_test_selected.copy()
+all_feature_names = selected_features.copy()
+all_feature_importance = []
+
+try:
+    # Define number of interaction features
+    interaction_feature_count = 10
+    X_interactions, interaction_names = create_interaction_features(
+        X_train_selected, selected_features, top_n=interaction_feature_count
+    )
+    
+    if X_interactions is not None and len(interaction_names) > 0:
+        print("\nEvaluating interaction feature importance...")
+        temp_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+        temp_rf.fit(X_interactions, y_train_final)
+        
+        interaction_importance = pd.DataFrame({
+            'Feature': interaction_names,
+            'Importance': temp_rf.feature_importances_
+        }).sort_values('Importance', ascending=False)
+        
+        print("\nInteraction feature importance ranking:")
+        print(interaction_importance)
+        
+        # Select top interaction features
+        top_interactions = interaction_importance.head(interaction_feature_count)
+        selected_indices = interaction_importance.index[:interaction_feature_count]
+        
+        print(f"\nSelecting top {interaction_feature_count} interaction features:")
+        for idx, row in top_interactions.iterrows():
+            print(f"{row['Feature']}: {row['Importance']:.4f}")
+        
+        # Add selected interaction features to training set
+        X_train_enhanced = np.hstack([X_train_selected, X_interactions[:, selected_indices]])
+        
+        # Create same interaction features for test set
+        X_test_interactions, _ = create_interaction_features(
+            X_test_selected, selected_features, top_n=10
+        )
+        if X_test_interactions is not None:
+            X_test_enhanced = np.hstack([X_test_selected, X_test_interactions[:, selected_indices]])
+            
+            # Calculate importance of all features
+            print("\nCalculating importance of final feature set including interaction features...")
+            final_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+            final_rf.fit(X_train_enhanced, y_train_final)
+            
+            # Get original feature importance
+            original_importance = final_rf.feature_importances_[:len(selected_features)]
+            # Get interaction feature importance
+            interaction_importance_values = final_rf.feature_importances_[len(selected_features):]
+            
+            # Combine all feature importance
+            all_feature_importance = original_importance.tolist() + interaction_importance_values.tolist()
+            
+            # Update feature name list
+            all_feature_names.extend([interaction_names[i] for i in selected_indices])
+            print(f"\nNumber of features in final set: {len(all_feature_names)}")
+            print("Final feature list and importance:")
+            for i, (name, importance) in enumerate(zip(all_feature_names, all_feature_importance), 1):
+                print(f"{i}. {name}: {importance:.4f}")
+            
+            # Export final feature list and importance to csv
+            final_feature_list_csv = os.path.join(output_dir, "5.final_feature_list.csv")
+            pd.DataFrame({
+                'Feature': all_feature_names,
+                'Importance': all_feature_importance
+            }).sort_values('Importance', ascending=False).to_csv(final_feature_list_csv, index=False)
+            print(f"Final feature list and importance exported to: {final_feature_list_csv}")
+        else:
+            print("\nWarning: Unable to create interaction features for test set, using original features")
+            # Export original feature list
+            final_feature_list_csv = os.path.join(output_dir, "5.final_feature_list.csv")
+            
+            # Calculate original feature importance
+            final_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+            final_rf.fit(X_train_selected, y_train_final)
+            all_feature_importance = final_rf.feature_importances_
+            
+            pd.DataFrame({
+                'Feature': all_feature_names,
+                'Importance': all_feature_importance
+            }).sort_values('Importance', ascending=False).to_csv(final_feature_list_csv, index=False)
+            print(f"Original feature list and importance exported to: {final_feature_list_csv}")
+    else:
+        print("\nNo interaction features created, using original feature set")
+        # Export original feature list
+        final_feature_list_csv = os.path.join(output_dir, "5.final_feature_list.csv")
+        
+        # Calculate original feature importance
+        final_rf = RandomForestClassifier(n_estimators=100, random_state=42)
+        final_rf.fit(X_train_selected, y_train_final)
+        all_feature_importance = final_rf.feature_importances_
+        
+        pd.DataFrame({
+            'Feature': all_feature_names,
+            'Importance': all_feature_importance
+        }).sort_values('Importance', ascending=False).to_csv(final_feature_list_csv, index=False)
+        print(f"Original feature list and importance exported to: {final_feature_list_csv}")
+except Exception as e:
+    print(f"\nError creating interaction features: {str(e)}")
+    print("Proceeding with cleaned original feature set")
+
+# 3. Evaluate Feature Engineering Effect
+print("\n=== Evaluating Feature Engineering Effect ===")
+print(f"\nOriginal feature count: {len(feature_cols)}")
+print(f"Feature count after redundancy removal: {len(selected_features)}")
+print(f"Feature count after adding interactions: {X_train_enhanced.shape[1]}")
+
+# Create internal validation set to verify model performance (split from enhanced training set)
+X_train_inner, X_val, y_train_inner, y_val = train_test_split(
+    X_train_enhanced, y_train_final, test_size=0.2, random_state=42, stratify=y_train_final
+)
+
+# 4. Model Training and Evaluation
+print("Starting model training and evaluation...")
+
+# Import warnings to handle warnings
+import warnings
+# Filter specific convergence warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.neural_network')
+
+# Modify MLP and SVM model configuration
+models = {
+    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced'),
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+    'SVM': SVC(
+        probability=True, 
+        random_state=4
