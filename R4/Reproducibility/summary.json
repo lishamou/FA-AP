@@ -1,0 +1,166 @@
+{
+  "n_scored": 371,
+  "n_os": 365,
+  "n_after_os_and_clinical": 339,
+  "n_events": 114,
+  "os_events": 130,
+  "missing_baseline": {
+    "age": 1,
+    "sex": 0,
+    "stage": 24,
+    "grade": 5,
+    "time": 6,
+    "event": 6
+  },
+  "module_size_min": 3,
+  "mutation": {
+    "n": 322,
+    "tp53": 100,
+    "ctnnb1": 89,
+    "joint": 21,
+    "r": -0.15639224595219434,
+    "perm_p": 0.7506,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 37,
+      "TP53": 21
+    }
+  },
+  "mutation_gsva": {
+    "n": 322,
+    "tp53": 100,
+    "ctnnb1": 89,
+    "joint": 21,
+    "r": -0.06748280131115787,
+    "perm_p": 0.8805,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 36,
+      "TP53": 26
+    }
+  },
+  "covariates": [
+    "age",
+    "sex",
+    "stage",
+    "grade",
+    "HBV",
+    "HCV",
+    "alcohol"
+  ],
+  "mutation_etiology_rank": {
+    "n": 322,
+    "tp53": 100,
+    "ctnnb1": 89,
+    "joint": 21,
+    "r": -0.12372443072647854,
+    "perm_p": 0.8014,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 37,
+      "TP53": 21
+    }
+  },
+  "mutation_etiology_gsva": {
+    "n": 322,
+    "tp53": 100,
+    "ctnnb1": 89,
+    "joint": 21,
+    "r": -0.05667969165102504,
+    "perm_p": 0.9005,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 36,
+      "TP53": 26
+    }
+  },
+  "purity_audit": {
+    "rna_primary_tumors": 371,
+    "dna_portion_matches": 355,
+    "unmatched_portions": 16,
+    "usable_purity": 354,
+    "conflicting_purity_patients": 0,
+    "clinical_mutation_complete": 322,
+    "matched_mutation_cases": 309,
+    "purity_median": 0.73,
+    "purity_q1": 0.56,
+    "purity_q3": 0.84,
+    "purity_min": 0.2,
+    "purity_max": 1.0
+  },
+  "mutation_matched_clinical_rank": {
+    "n": 309,
+    "tp53": 99,
+    "ctnnb1": 88,
+    "joint": 21,
+    "r": -0.10552910899061053,
+    "perm_p": 0.8303,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 37,
+      "TP53": 20
+    }
+  },
+  "mutation_matched_purity_rank": {
+    "n": 309,
+    "tp53": 99,
+    "ctnnb1": 88,
+    "joint": 21,
+    "r": -0.4257536038744961,
+    "perm_p": 0.3265,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 19,
+      "TP53": 18
+    }
+  },
+  "mutation_matched_clinical_gsva": {
+    "n": 309,
+    "tp53": 99,
+    "ctnnb1": 88,
+    "joint": 21,
+    "r": -0.06880364561453547,
+    "perm_p": 0.8727,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 35,
+      "TP53": 26
+    }
+  },
+  "mutation_matched_purity_gsva": {
+    "n": 309,
+    "tp53": 99,
+    "ctnnb1": 88,
+    "joint": 21,
+    "r": -0.20210539751153317,
+    "perm_p": 0.6168,
+    "permutations": 9999,
+    "discoveries": {
+      "CTNNB1": 18,
+      "TP53": 26
+    }
+  },
+  "network": {
+    "total_pairs": 1953,
+    "display_edges": 744,
+    "positive": 671,
+    "negative": 73,
+    "shared_edges": 257,
+    "preserved": 705
+  },
+  "t_category": {
+    "n_tcga": 338,
+    "events_tcga": 114,
+    "n_icgc": 194,
+    "events_icgc": 34
+  },
+  "external": {
+    "n": 194,
+    "events": 34,
+    "common_genes": 19084,
+    "clinical": [
+      "age",
+      "sex"
+    ]
+  }
+}
